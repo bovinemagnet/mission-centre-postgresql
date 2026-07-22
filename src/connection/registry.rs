@@ -20,11 +20,11 @@
 
 use gtk::prelude::SettingsExt;
 use gtk::{gio, glib};
-use uuid::Uuid;
 
 use crate::connection::params::ConnectionParams;
 
 const KEY: &str = "servers";
+const BACKUP_KEY: &str = "servers-backup";
 
 /// A malformed value yields an empty list rather than a panic: the setting is
 /// user-editable, and a bad edit must not stop the application starting.
@@ -32,8 +32,8 @@ pub fn parse(json: &str) -> Vec<ConnectionParams> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
-pub fn serialise(servers: &[ConnectionParams]) -> String {
-    serde_json::to_string(servers).unwrap_or_else(|_| "[]".to_string())
+pub fn serialise(servers: &[ConnectionParams]) -> Result<String, serde_json::Error> {
+    serde_json::to_string(servers)
 }
 
 pub fn load(settings: &gio::Settings) -> Vec<ConnectionParams> {
@@ -41,13 +41,24 @@ pub fn load(settings: &gio::Settings) -> Vec<ConnectionParams> {
 }
 
 pub fn save(settings: &gio::Settings, servers: &[ConnectionParams]) -> Result<(), glib::BoolError> {
-    settings.set_string(KEY, &serialise(servers))
+    let current = settings.string(KEY);
+    if !current.is_empty() && serde_json::from_str::<Vec<ConnectionParams>>(&current).is_err() {
+        // The stored value doesn't parse but isn't empty: it may be a
+        // wrong-shaped value from a future version of the app. Salvage it
+        // before it gets overwritten below.
+        settings.set_string(BACKUP_KEY, &current)?;
+    }
+
+    let json =
+        serialise(servers).map_err(|_| glib::bool_error!("failed to serialise server list"))?;
+    settings.set_string(KEY, &json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::params::SslMode;
+    use uuid::Uuid;
 
     fn server(label: &str) -> ConnectionParams {
         ConnectionParams {
@@ -64,7 +75,7 @@ mod tests {
     #[test]
     fn round_trips_a_list_of_servers() {
         let servers = vec![server("one"), server("two")];
-        let parsed = parse(&serialise(&servers));
+        let parsed = parse(&serialise(&servers).unwrap());
         assert_eq!(parsed, servers);
     }
 
@@ -82,8 +93,25 @@ mod tests {
     }
 
     #[test]
+    fn wrong_shaped_but_valid_json_yields_no_servers() {
+        // Syntactically valid JSON that doesn't match the expected shape,
+        // e.g. written by a future version of the app, must not panic.
+        assert!(parse("{}").is_empty());
+        assert!(parse("[123]").is_empty());
+        assert!(parse("null").is_empty());
+    }
+
+    #[test]
+    fn serialise_round_trips_successfully() {
+        let servers = vec![server("one"), server("two")];
+        let result = serialise(&servers);
+        assert!(result.is_ok());
+        assert_eq!(parse(&result.unwrap()), servers);
+    }
+
+    #[test]
     fn serialised_servers_never_contain_a_password() {
-        let json = serialise(&[server("prod")]);
+        let json = serialise(&[server("prod")]).unwrap();
         assert!(!json.to_lowercase().contains("password"));
     }
 }

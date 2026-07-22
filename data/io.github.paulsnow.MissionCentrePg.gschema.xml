@@ -17,6 +17,10 @@
       <default>'[]'</default>
       <summary>Configured servers as a JSON array. Never contains passwords.</summary>
     </key>
+    <key name="servers-backup" type="s">
+      <default>''</default>
+      <summary>Holds the last unparseable value of "servers", so a corrupt or wrong-shaped value is not lost when the application next saves.</summary>
+    </key>
     <key name="sample-interval-ms" type="i">
       <range min="500" max="60000"/>
       <default>2000</default>
