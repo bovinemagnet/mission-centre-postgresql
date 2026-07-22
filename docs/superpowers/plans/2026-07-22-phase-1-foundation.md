@@ -3632,7 +3632,6 @@ use gtk::{gio, glib};
 
 use mission_centre_pg::collector::worker::{spawn, CollectorEvent, CollectorHandle};
 use mission_centre_pg::connection::params::ConnectionParams;
-use mission_centre_pg::connection::probe::MIN_SUPPORTED_VERSION;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{McpgOverviewPage, McpgSessionsPage};
@@ -3759,7 +3758,9 @@ impl MissionCentrePgWindow {
         dialog.connect_added(move |params| {
             let mut servers = registry::load(&window.settings());
             servers.push(params.clone());
-            let _ = registry::save(&window.settings(), &servers);
+            if let Err(e) = registry::save(&window.settings(), &servers) {
+                gtk::glib::g_warning!("mission-centre-pg", "could not save the server list: {e}");
+            }
             window.reload_servers();
         });
         dialog.present(Some(self));
@@ -3828,7 +3829,7 @@ impl MissionCentrePgWindow {
                 ));
                 imp.sessions_page.set_privilege_limited(limited);
 
-                if info.version_num < MIN_SUPPORTED_VERSION {
+                if info.is_below_floor() {
                     imp.error_banner.set_revealed(true);
                     imp.error_banner.set_title(&i18n_f(
                         "PostgreSQL {} is older than the supported floor of 14. Some statistics may be missing.",
