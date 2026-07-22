@@ -1219,7 +1219,9 @@ impl SslMode {
 /// Everything needed to reach a server *except* the password, which lives in
 /// the system secret store. This type is serialised into GSettings, so it must
 /// never gain a password field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Debug is hand-written below, not derived: a derived Debug would
+// automatically print any field added later, including a password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionParams {
     pub id: Uuid,
     pub label: String,
