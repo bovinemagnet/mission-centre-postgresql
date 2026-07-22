@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::connection::credentials;
 use crate::connection::params::{ConnectionParams, SslMode};
+use crate::i18n::i18n;
 
 type AddedCallback = Box<dyn Fn(&ConnectionParams)>;
 
@@ -54,6 +55,8 @@ mod imp {
         pub add_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub cancel_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub toast_overlay: TemplateChild<adw::ToastOverlay>,
 
         pub on_added: RefCell<Option<AddedCallback>>,
     }
@@ -113,12 +116,17 @@ impl McpgAddServerDialog {
     fn submit(&self) {
         let imp = self.imp();
 
+        // Clear stale validation state from a previous attempt before running
+        // any check, so a field's "error" styling always reflects whether its
+        // current value passed this attempt's validation.
+        imp.host_row.remove_css_class("error");
+        imp.port_row.remove_css_class("error");
+
         let host = imp.host_row.text().trim().to_string();
         if host.is_empty() {
             imp.host_row.add_css_class("error");
             return;
         }
-        imp.host_row.remove_css_class("error");
 
         let port: u16 = match imp.port_row.text().trim().parse() {
             Ok(port) => port,
@@ -127,7 +135,6 @@ impl McpgAddServerDialog {
                 return;
             }
         };
-        imp.port_row.remove_css_class("error");
 
         let label = imp.label_row.text().trim().to_string();
         let label = if label.is_empty() {
@@ -153,14 +160,39 @@ impl McpgAddServerDialog {
         // The password goes straight to the secret store and is never held on
         // ConnectionParams, which is serialised into GSettings.
         let password = imp.password_row.text();
-        if let Err(e) = credentials::store_password(&params.id, &password) {
-            gtk::glib::g_warning!("mission-centre-pg", "could not store the password: {e}");
+        let store_result = credentials::store_password(&params.id, &password);
+
+        // Take the callback out of the RefCell before invoking it: if the
+        // callback itself calls `connect_added` on this dialog, that
+        // `replace()`s the same RefCell, which would panic on a re-entrant
+        // borrow if we were still holding one here.
+        if let Some(callback) = imp.on_added.take() {
+            callback(&params);
+            imp.on_added.replace(Some(callback));
         }
 
-        if let Some(callback) = imp.on_added.borrow().as_ref() {
-            callback(&params);
+        match store_result {
+            Ok(()) => {
+                self.close();
+            }
+            Err(e) => {
+                gtk::glib::g_warning!("mission-centre-pg", "could not store the password: {e}");
+
+                // The server details are still valid, so the dialog must
+                // close either way — but not immediately: a toast shown on a
+                // dialog that has already closed has nowhere to be seen.
+                // Delay the close until the toast itself goes away, whether
+                // the user dismisses it or it times out on its own.
+                let toast = adw::Toast::new(&i18n(
+                    "The password could not be saved to the keyring. You will need to enter it again.",
+                ));
+                let dialog = self.clone();
+                toast.connect_dismissed(move |_| {
+                    dialog.close();
+                });
+                imp.toast_overlay.add_toast(toast);
+            }
         }
-        self.close();
     }
 }
 
