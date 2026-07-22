@@ -21,3 +21,4 @@
 pub mod credentials;
 pub mod params;
 pub mod probe;
+pub mod registry;
