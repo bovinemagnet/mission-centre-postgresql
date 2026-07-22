@@ -82,6 +82,27 @@ fn stop_requested(stop: &async_channel::Receiver<()>) -> bool {
     !matches!(stop.try_recv(), Err(async_channel::TryRecvError::Empty))
 }
 
+/// Emit a lifecycle event. Blocks only until the collector is asked to stop,
+/// so a stalled consumer can never wedge the sampler somewhere `stop()`
+/// cannot reach it. Returns false when we should shut down.
+async fn emit(
+    events: &async_channel::Sender<CollectorEvent>,
+    stop: &async_channel::Receiver<()>,
+    event: CollectorEvent,
+) -> bool {
+    tokio::select! {
+        result = events.send(event) => result.is_ok(),
+        _ = stop.recv() => false,
+    }
+}
+
+/// Emit a sample, dropping it if the consumer is behind. Monitoring data has
+/// no value once late, and `previous` still advances so rates stay accurate
+/// across a dropped sample.
+fn emit_sample(events: &async_channel::Sender<CollectorEvent>, snapshot: Box<Snapshot>) {
+    let _ = events.try_send(CollectorEvent::Sample(snapshot));
+}
+
 /// Why `sample_loop` returned control to `run`.
 enum Exit {
     /// The controller asked us to stop, or dropped the handle.
@@ -136,13 +157,31 @@ async fn run(
             return;
         }
 
-        let _ = events.send(CollectorEvent::Connecting).await;
+        if !emit(&events, &stop, CollectorEvent::Connecting).await {
+            return;
+        }
 
-        match connect(&params, &password).await {
+        // The connect-and-probe step is otherwise unbounded from `stop`'s
+        // point of view: a server that completes the TCP handshake and then
+        // never answers would leave the thread parked here indefinitely.
+        let connect_result = tokio::select! {
+            result = connect(&params, &password) => result,
+            _ = stop.recv() => return,
+        };
+
+        match connect_result {
             Ok((client, info)) => {
-                let _ = events.send(CollectorEvent::Connected(info)).await;
+                if !emit(&events, &stop, CollectorEvent::Connected(info)).await {
+                    return;
+                }
                 match sample_loop(&client, interval, &events, &stop).await {
-                    Exit::Stopped => return,
+                    Exit::Stopped => {
+                        // We are already shutting down, so route this
+                        // through the non-blocking path rather than emit(),
+                        // which would see the pending stop and drop it.
+                        let _ = events.try_send(CollectorEvent::Disconnected);
+                        return;
+                    }
                     Exit::Failed { had_success } => {
                         consecutive_failures = if had_success {
                             0
@@ -151,10 +190,14 @@ async fn run(
                         };
                     }
                 }
-                let _ = events.send(CollectorEvent::Disconnected).await;
+                if !emit(&events, &stop, CollectorEvent::Disconnected).await {
+                    return;
+                }
             }
             Err(e) => {
-                let _ = events.send(CollectorEvent::Error(e)).await;
+                if !emit(&events, &stop, CollectorEvent::Error(e)).await {
+                    return;
+                }
                 consecutive_failures = consecutive_failures.saturating_add(1);
             }
         }
@@ -222,14 +265,13 @@ async fn sample_loop(
                 consecutive_failures = 0;
                 had_success = true;
                 previous = Some((snapshot.totals, snapshot.taken_at));
-                // A stalled consumer must never wedge shutdown, and a late
-                // sample has no monitoring value anyway, so drop it rather
-                // than block on a full channel.
-                let _ = events.try_send(CollectorEvent::Sample(Box::new(snapshot)));
+                emit_sample(events, Box::new(snapshot));
             }
             Err(e) => {
                 consecutive_failures += 1;
-                let _ = events.send(CollectorEvent::Error(e)).await;
+                if !emit(events, stop, CollectorEvent::Error(e)).await {
+                    return Exit::Stopped;
+                }
                 if consecutive_failures >= FAILURES_BEFORE_DISCONNECT {
                     return Exit::Failed { had_success };
                 }
@@ -339,7 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_handle_without_calling_stop_closes_the_stop_channel() {
+    fn dropping_the_handle_sends_a_stop_signal_before_closing_the_channel() {
+        // Asserting only `is_closed()` here would pass even with the `Drop`
+        // impl deleted, since dropping the struct also drops the `stop`
+        // sender field on its own. Assert the buffered stop message that
+        // only the `Drop` impl's call to `self.stop()` can have produced.
         let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
         let (_event_tx, event_rx) = async_channel::bounded::<CollectorEvent>(1);
         let handle = CollectorHandle {
@@ -349,6 +395,7 @@ mod tests {
 
         drop(handle);
 
+        assert!(matches!(stop_rx.try_recv(), Ok(())));
         assert!(stop_rx.is_closed());
     }
 }

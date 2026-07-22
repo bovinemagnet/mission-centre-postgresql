@@ -84,7 +84,12 @@ impl ConnectionParams {
             .user(&self.user)
             .password(password)
             .ssl_mode(self.ssl_mode.to_pg())
-            .application_name("mission-centre-pg");
+            .application_name("mission-centre-pg")
+            // A server that completes the TCP handshake but never answers
+            // must not be able to block the connect step for ever; the
+            // collector layers its own stop-aware cancellation on top of
+            // this, but a bounded timeout here is the last line of defence.
+            .connect_timeout(std::time::Duration::from_secs(10));
         config
     }
 }
