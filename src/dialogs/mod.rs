@@ -1,4 +1,4 @@
-/* lib.rs
+/* dialogs/mod.rs
  *
  * Copyright 2026 Paul Snow
  *
@@ -18,8 +18,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-pub mod collector;
-pub mod connection;
-pub mod dialogs;
-pub mod i18n;
-pub mod widgets;
+pub mod add_server;
+
+pub use add_server::McpgAddServerDialog;
