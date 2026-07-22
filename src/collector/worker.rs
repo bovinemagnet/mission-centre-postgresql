@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use tokio_postgres::Client;
+use tokio_postgres::{error::SqlState, Client};
 
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
@@ -69,15 +69,33 @@ impl CollectorHandle {
     }
 }
 
+impl Drop for CollectorHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// True when the controller has asked us to stop, or has dropped the handle.
+/// A closed channel means the consumer is gone, so there is nobody left to
+/// sample for.
+fn stop_requested(stop: &async_channel::Receiver<()>) -> bool {
+    !matches!(stop.try_recv(), Err(async_channel::TryRecvError::Empty))
+}
+
+/// Why `sample_loop` returned control to `run`.
+enum Exit {
+    /// The controller asked us to stop, or dropped the handle.
+    Stopped,
+    /// Gave up after `FAILURES_BEFORE_DISCONNECT` consecutive failed samples.
+    /// `had_success` records whether at least one sample succeeded earlier in
+    /// this connection's lifetime, which decides whether the backoff counter
+    /// resets.
+    Failed { had_success: bool },
+}
+
 /// 1s, 2s, 4s, 8s, 16s, then 30s for ever.
 ///
-/// The brief specifies `1u64.saturating_shl(n.min(16))`, but `saturating_shl`
-/// is not a stable method on integer primitives (there is no such inherent
-/// method on `u64` in stable Rust — only `checked_shl`, `wrapping_shl`, and
-/// `overflowing_shl`), so that line does not compile. The shift amount is
-/// already bounded to `min(16)`, so a plain `<<` cannot overflow a `u64`
-/// (`1u64 << 16` is well within range); the final `.min(30)` still enforces
-/// the cap the test expects.
+/// The shift amount is bounded to 16, so `1u64 << n` cannot overflow.
 pub fn backoff_delay(consecutive_failures: u32) -> Duration {
     let seconds = 1u64 << consecutive_failures.min(16);
     Duration::from_secs(seconds.min(30))
@@ -111,10 +129,10 @@ async fn run(
     events: async_channel::Sender<CollectorEvent>,
     stop: async_channel::Receiver<()>,
 ) {
-    let mut consecutive_connect_failures = 0u32;
+    let mut consecutive_failures = 0u32;
 
     loop {
-        if stop.try_recv().is_ok() {
+        if stop_requested(&stop) {
             return;
         }
 
@@ -122,20 +140,33 @@ async fn run(
 
         match connect(&params, &password).await {
             Ok((client, info)) => {
-                consecutive_connect_failures = 0;
                 let _ = events.send(CollectorEvent::Connected(info)).await;
-                sample_loop(&client, interval, &events, &stop).await;
+                match sample_loop(&client, interval, &events, &stop).await {
+                    Exit::Stopped => return,
+                    Exit::Failed { had_success } => {
+                        consecutive_failures = if had_success {
+                            0
+                        } else {
+                            consecutive_failures.saturating_add(1)
+                        };
+                    }
+                }
                 let _ = events.send(CollectorEvent::Disconnected).await;
             }
             Err(e) => {
                 let _ = events.send(CollectorEvent::Error(e)).await;
-                let delay = backoff_delay(consecutive_connect_failures);
-                consecutive_connect_failures = consecutive_connect_failures.saturating_add(1);
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = stop.recv() => return,
-                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
             }
+        }
+
+        if stop_requested(&stop) {
+            return;
+        }
+
+        let delay = backoff_delay(consecutive_failures.saturating_sub(1));
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = stop.recv() => return,
         }
     }
 }
@@ -158,12 +189,12 @@ async fn connect(
     client
         .batch_execute(STATEMENT_TIMEOUT)
         .await
-        .map_err(|e| CollectorError::Query(e.to_string()))?;
+        .map_err(map_query_error)?;
 
     let row = client
         .query_one(PROBE_SQL, &[])
         .await
-        .map_err(|e| CollectorError::Query(e.to_string()))?;
+        .map_err(map_query_error)?;
 
     Ok((client, map_server_info(&row)))
 }
@@ -176,35 +207,38 @@ async fn sample_loop(
     interval: Duration,
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
-) {
+) -> Exit {
     let mut previous: Option<(DatabaseCounters, Instant)> = None;
     let mut consecutive_failures = 0u32;
+    let mut had_success = false;
 
     loop {
-        if stop.try_recv().is_ok() {
-            return;
+        if stop_requested(stop) {
+            return Exit::Stopped;
         }
 
         match sample(client, previous).await {
             Ok(snapshot) => {
                 consecutive_failures = 0;
+                had_success = true;
                 previous = Some((snapshot.totals, snapshot.taken_at));
-                let _ = events
-                    .send(CollectorEvent::Sample(Box::new(snapshot)))
-                    .await;
+                // A stalled consumer must never wedge shutdown, and a late
+                // sample has no monitoring value anyway, so drop it rather
+                // than block on a full channel.
+                let _ = events.try_send(CollectorEvent::Sample(Box::new(snapshot)));
             }
             Err(e) => {
                 consecutive_failures += 1;
                 let _ = events.send(CollectorEvent::Error(e)).await;
                 if consecutive_failures >= FAILURES_BEFORE_DISCONNECT {
-                    return;
+                    return Exit::Failed { had_success };
                 }
             }
         }
 
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = stop.recv() => return,
+            _ = stop.recv() => return Exit::Stopped,
         }
     }
 }
@@ -257,13 +291,12 @@ async fn sample(
 }
 
 fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
-    let text = e.to_string();
-    if text.contains("statement timeout") || text.contains("canceling statement") {
+    if e.code() == Some(&SqlState::QUERY_CANCELED) {
         CollectorError::Timeout
     } else if e.is_closed() {
         CollectorError::LostConnection
     } else {
-        CollectorError::Query(text)
+        CollectorError::Query(e.to_string())
     }
 }
 
@@ -288,5 +321,34 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("password authentication failed"));
         assert!(!rendered.contains("postgresql://"));
+    }
+
+    #[test]
+    fn stop_requested_is_false_for_an_empty_channel_and_true_for_a_closed_one() {
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        assert!(!stop_requested(&rx));
+        drop(tx);
+        assert!(stop_requested(&rx));
+    }
+
+    #[test]
+    fn stop_requested_is_true_when_a_stop_message_is_pending() {
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        tx.try_send(()).unwrap();
+        assert!(stop_requested(&rx));
+    }
+
+    #[test]
+    fn dropping_the_handle_without_calling_stop_closes_the_stop_channel() {
+        let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+        let (_event_tx, event_rx) = async_channel::bounded::<CollectorEvent>(1);
+        let handle = CollectorHandle {
+            events: event_rx,
+            stop: stop_tx,
+        };
+
+        drop(handle);
+
+        assert!(stop_rx.is_closed());
     }
 }
