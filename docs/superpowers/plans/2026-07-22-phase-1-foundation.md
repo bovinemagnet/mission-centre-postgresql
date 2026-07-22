@@ -109,6 +109,16 @@ authors = ["Paul Snow"]
 license = "GPL-3.0-or-later"
 description = "A GTK4 desktop monitor for PostgreSQL servers"
 
+# lib + bin from the start: the integration tests in Task 6 can only reach
+# library code, and the pages/widgets/dialogs modules need the i18n helpers.
+[lib]
+name = "mission_centre_pg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mission-centre-pg"
+path = "src/main.rs"
+
 [dependencies]
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
@@ -360,6 +370,14 @@ pub fn i18n_f(format: &str, args: &[&str]) -> String {
 }
 ```
 
+Also create `src/lib.rs` with the single module it holds so far. Later tasks add
+to it; `i18n` lives here rather than in the binary because the pages, dialogs
+and widgets modules all use it.
+
+```rust
+pub mod i18n;
+```
+
 - [ ] **Step 8: Write `src/application.rs`**
 
 Use the same GPL header as Step 7 on this and every subsequent new file.
@@ -432,6 +450,7 @@ impl Default for MissionCentrePgApplication {
 
 ```rust
 use adw::subclass::prelude::*;
+use gtk::prelude::IsA;
 use gtk::{gio, glib};
 
 mod imp {
@@ -474,19 +493,16 @@ impl MissionCentrePgWindow {
         glib::Object::builder().property("application", app).build()
     }
 }
-
-use gtk::prelude::IsA;
 ```
 
 - [ ] **Step 10: Write `src/main.rs`**
 
 ```rust
 mod application;
-mod i18n;
 mod window;
 
-use gtk::gio;
 use gtk::prelude::*;
+use gtk::{gio, glib};
 
 use application::MissionCentrePgApplication;
 
@@ -501,9 +517,11 @@ fn main() -> glib::ExitCode {
 
     MissionCentrePgApplication::new().run()
 }
-
-use gtk::glib;
 ```
+
+Every `use` in this project goes at the top of its file. If a code block later in
+this plan shows a trailing `use`, move it to the top — that is a transcription
+slip in the plan, not a style to copy.
 
 - [ ] **Step 11: Write `.gitignore`, `README.md` and `COPYING`**
 
@@ -582,7 +600,7 @@ This is the heart of the correctness story, it is pure, and it is where TDD earn
 
 **Files:**
 - Create: `src/collector/mod.rs` (module declarations only for now), `src/collector/snapshot.rs`, `src/collector/rates.rs`
-- Modify: `src/main.rs` (add `mod collector;`)
+- Modify: `src/lib.rs` (add `pub mod collector;`)
 
 **Interfaces:**
 - Consumes: nothing
@@ -860,7 +878,7 @@ pub mod rates;
 pub mod snapshot;
 ```
 
-Add `mod collector;` to `src/main.rs`.
+Add `pub mod collector;` to `src/lib.rs`.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1077,7 +1095,7 @@ git commit -m "feat: catalog SQL statements and row mapping"
 
 **Files:**
 - Create: `src/connection/mod.rs`, `src/connection/params.rs`, `src/connection/credentials.rs`
-- Modify: `src/main.rs` (add `mod connection;`)
+- Modify: `src/lib.rs` (add `pub mod connection;`)
 
 **Interfaces:**
 - Consumes: nothing
@@ -1267,7 +1285,7 @@ pub mod credentials;
 pub mod params;
 ```
 
-Add `mod connection;` to `src/main.rs`.
+Add `pub mod connection;` to `src/lib.rs`.
 
 - [ ] **Step 6: Build and run all tests**
 
@@ -1449,40 +1467,15 @@ This is the task that earns its keep: it is the only thing that can catch a colu
 - Consumes: `DATABASE_STATS_SQL`, `ACTIVITY_SQL`, `SETTINGS_SQL`, `DATABASE_SIZE_SQL`, `map_database_counters`, `map_session`, `map_settings` (Task 3); `PROBE_SQL`, `map_server_info`, `PrivilegeLevel` (Task 5)
 - Produces: a passing `cargo test --test portability`
 
-`tests/` is an integration-test directory, so it can only use the crate's public API. The crate is currently a binary. **Add a library target** so tests can reach the modules.
+`tests/` is an integration-test directory, so it can only use the crate's public API. The lib target already exists from Task 1, and Tasks 2–5 added `collector` and `connection` to `src/lib.rs`, so nothing needs restructuring here.
 
-- [ ] **Step 1: Turn the crate into a lib + bin**
+- [ ] **Step 1: Confirm the library exposes what the tests need**
 
-Add to `Cargo.toml`:
-
-```toml
-[lib]
-name = "mission_centre_pg"
-path = "src/lib.rs"
-
-[[bin]]
-name = "mission-centre-pg"
-path = "src/main.rs"
+```bash
+grep -n "pub mod" src/lib.rs
 ```
 
-Create `src/lib.rs`:
-
-```rust
-pub mod collector;
-pub mod connection;
-```
-
-Change `src/main.rs` so its first lines are:
-
-```rust
-use mission_centre_pg::{collector, connection};
-
-mod application;
-mod i18n;
-mod window;
-```
-
-and delete the now-duplicated `mod collector;` / `mod connection;` declarations.
+Expected: `i18n`, `collector` and `connection` are all listed. Add any that are missing.
 
 - [ ] **Step 2: Configure podman as the container runtime**
 
@@ -1620,13 +1613,6 @@ async fn a_role_without_pg_monitor_is_classified_as_limited() {
         .batch_execute("CREATE ROLE watcher LOGIN PASSWORD 'watcher'")
         .await
         .expect("failed to create the limited role");
-
-    let port_row = client
-        .query_one("SELECT inet_server_port()::int AS port", &[])
-        .await
-        .expect("failed to read the server port");
-    let port: i32 = port_row.get("port");
-    let _ = port;
 
     let limited = client
         .query_one(
@@ -2305,11 +2291,16 @@ template $McpgSidebarRow: Gtk.Box {
 - [ ] **Step 6: Write `src/widgets/sidebar_row.rs`**
 
 ```rust
+use std::cell::RefCell;
+
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crate::widgets::graph_widget::GraphWidget;
+use crate::widgets::ring_buffer::RingBuffer;
+
+const SPARKLINE_POINTS: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
@@ -2334,7 +2325,7 @@ impl ConnectionState {
 mod imp {
     use super::*;
 
-    #[derive(Default, gtk::CompositeTemplate)]
+    #[derive(gtk::CompositeTemplate)]
     #[template(resource = "/io/github/paulsnow/MissionCentrePg/ui/sidebar_row.ui")]
     pub struct McpgSidebarRow {
         #[template_child]
@@ -2345,6 +2336,20 @@ mod imp {
         pub subheading_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub graph: TemplateChild<GraphWidget>,
+
+        pub series: RefCell<RingBuffer>,
+    }
+
+    impl Default for McpgSidebarRow {
+        fn default() -> Self {
+            Self {
+                state_icon: Default::default(),
+                heading_label: Default::default(),
+                subheading_label: Default::default(),
+                graph: Default::default(),
+                series: RefCell::new(RingBuffer::new(SPARKLINE_POINTS)),
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -2395,6 +2400,22 @@ impl McpgSidebarRow {
 
     pub fn graph(&self) -> GraphWidget {
         self.imp().graph.get()
+    }
+
+    /// Append one point to the row's sparkline and redraw it.
+    pub fn push_value(&self, value: f64) {
+        let imp = self.imp();
+        imp.series.borrow_mut().push(value);
+        imp.graph
+            .set_data_points(&imp.series.borrow().values(), 0.0);
+    }
+
+    /// Drop the series so a reconnect to a different server does not inherit
+    /// the previous one's shape.
+    pub fn clear_series(&self) {
+        let imp = self.imp();
+        imp.series.replace(RingBuffer::new(SPARKLINE_POINTS));
+        imp.graph.set_data_points(&[], 0.0);
     }
 }
 
@@ -2519,8 +2540,8 @@ Expected: FAIL — `cannot find function parse`.
 - [ ] **Step 3: Write the implementation**
 
 ```rust
-use gtk::gio;
 use gtk::prelude::SettingsExt;
+use gtk::{gio, glib};
 use uuid::Uuid;
 
 use crate::connection::params::ConnectionParams;
@@ -2547,8 +2568,6 @@ pub fn save(
 ) -> Result<(), glib::BoolError> {
     settings.set_string(KEY, &serialise(servers))
 }
-
-use gtk::glib;
 ```
 
 Add `pub mod registry;` to `src/connection/mod.rs`.
@@ -3295,7 +3314,8 @@ use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::glib;
+use gtk::prelude::{Cast, CastNone};
+use gtk::{gio, glib};
 
 use crate::collector::snapshot::Session;
 
@@ -3425,8 +3445,6 @@ mod imp {
 
     impl WidgetImpl for McpgSessionsPage {}
     impl BoxImpl for McpgSessionsPage {}
-
-    use gtk::gio;
 }
 
 glib::wrapper! {
@@ -3564,10 +3582,6 @@ impl Default for McpgSessionsPage {
         Self::new()
     }
 }
-
-use gtk::gio;
-use gtk::prelude::Cast;
-use gtk::prelude::CastNone;
 ```
 
 Note the two `set_incremental(false)` calls. Mission Center's `gtk-issue.md` documents a GTK 4.22 crash in `gtk_sort_list_model_items_changed_cb` with a `FilterListModel → SortListModel` chain in incremental mode under rapid `items-changed`. This page has exactly that shape and updates every two seconds. Do not remove those calls.
@@ -3703,6 +3717,7 @@ use std::cell::RefCell;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use gtk::prelude::{Cast, IsA};
 use gtk::{gio, glib};
 
 use mission_centre_pg::collector::worker::{spawn, CollectorEvent, CollectorHandle};
@@ -3713,8 +3728,9 @@ use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{McpgOverviewPage, McpgSessionsPage};
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
+use mission_centre_pg::i18n::{i18n, i18n_f};
+
 use crate::application::APP_ID;
-use crate::i18n::{i18n, i18n_f};
 
 mod imp {
     use super::*;
@@ -3915,8 +3931,7 @@ impl MissionCentrePgWindow {
                 imp.sessions_page.update(&snapshot.sessions);
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
-                    row.graph()
-                        .set_data_points(&[snapshot.session_counts.total() as f64], 0.0);
+                    row.push_value(snapshot.session_counts.total() as f64);
                 }
             }
             CollectorEvent::Error(error) => {
@@ -3934,11 +3949,7 @@ impl MissionCentrePgWindow {
         }
     }
 }
-
-use gtk::prelude::{Cast, IsA};
 ```
-
-The sidebar sparkline needs its own `RingBuffer` per row for a real series; the single-point call above is a placeholder that compiles. Give `McpgSidebarRow` an internal `RefCell<RingBuffer>` and a `push_value(f64)` method that appends and redraws, then call `row.push_value(...)` here instead. Do this as part of this step, not later.
 
 - [ ] **Step 3: Build**
 
