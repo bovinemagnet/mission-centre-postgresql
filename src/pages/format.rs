@@ -19,6 +19,12 @@
  */
 
 pub fn format_rate(value: f64) -> String {
+    // NaN/infinity happens when a delta is divided by a near-zero elapsed
+    // duration. Rendering "NaN%" or a saturated i64::MAX would present a
+    // fabricated measurement, so show the same em dash as an absent value.
+    if !value.is_finite() {
+        return "—".to_string();
+    }
     if value > 0.0 && value < 10.0 {
         return format!("{value:.1}");
     }
@@ -53,11 +59,13 @@ pub fn format_bytes(bytes: i64) -> String {
 }
 
 /// `None` renders as an em dash. Rendering it as 0% would assert that every
-/// block read missed cache, which is not what an absent ratio means.
+/// block read missed cache, which is not what an absent ratio means. A
+/// present but non-finite value (NaN/infinity) is no more a real number than
+/// an absent one, so it renders the same way.
 pub fn format_ratio(ratio: Option<f64>) -> String {
     match ratio {
-        Some(value) => format!("{:.1}%", value * 100.0),
-        None => "—".to_string(),
+        Some(value) if value.is_finite() => format!("{:.1}%", value * 100.0),
+        _ => "—".to_string(),
     }
 }
 
@@ -99,5 +107,33 @@ mod tests {
         // No blocks were accessed this interval. Showing 0% would claim every
         // read missed cache, which is not what happened.
         assert_eq!(format_ratio(None), "—");
+    }
+
+    #[test]
+    fn a_nan_rate_renders_as_a_dash_not_a_fabricated_zero() {
+        // A near-zero elapsed duration can turn a delta/duration rate into
+        // NaN. Casting that to i64 saturates to 0, silently fabricating a
+        // measurement that was never taken.
+        assert_eq!(format_rate(f64::NAN), "—");
+    }
+
+    #[test]
+    fn a_positive_infinite_rate_renders_as_a_dash_not_a_saturated_integer() {
+        // Casting f64::INFINITY to i64 saturates to i64::MAX, which is not a
+        // real measurement either.
+        assert_eq!(format_rate(f64::INFINITY), "—");
+    }
+
+    #[test]
+    fn a_negative_infinite_rate_renders_as_a_dash_not_a_saturated_integer() {
+        assert_eq!(format_rate(f64::NEG_INFINITY), "—");
+    }
+
+    #[test]
+    fn a_nan_ratio_renders_the_same_as_an_absent_ratio() {
+        // A present but non-finite ratio is no more a real number than an
+        // absent one, so "NaN%" must not appear.
+        assert_eq!(format_ratio(Some(f64::NAN)), format_ratio(None));
+        assert_eq!(format_ratio(Some(f64::NAN)), "—");
     }
 }

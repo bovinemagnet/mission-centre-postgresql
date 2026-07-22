@@ -185,8 +185,15 @@ impl McpgOverviewPage {
 
         imp.deadlocks_value
             .set_text(&format_rate(rates.deadlocks_per_sec));
+        // format_bytes takes an i64, so a non-finite rate must be caught
+        // here: casting NaN/infinity to i64 saturates silently instead of
+        // producing the em dash a fabricated measurement deserves.
         imp.temp_value
-            .set_text(&format_bytes(rates.temp_bytes_per_sec as i64));
+            .set_text(&if rates.temp_bytes_per_sec.is_finite() {
+                format_bytes(rates.temp_bytes_per_sec as i64)
+            } else {
+                "—".to_string()
+            });
     }
 }
 
