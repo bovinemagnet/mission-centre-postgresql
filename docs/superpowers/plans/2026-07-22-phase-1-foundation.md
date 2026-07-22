@@ -799,7 +799,8 @@ impl SessionCounts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `query_duration_secs` is an f64.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub pid: i32,
     pub user_name: Option<String>,
