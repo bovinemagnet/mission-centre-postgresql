@@ -1504,7 +1504,7 @@ Docker is not installed on this machine; podman is. `testcontainers` speaks the 
 
 ```bash
 systemctl --user enable --now podman.socket
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 podman info --format '{{.Host.RemoteSocket.Path}}'
 ```
 
@@ -1519,7 +1519,7 @@ The portability tests start real PostgreSQL containers. This machine has podman
 rather than docker, so point the Docker API client at podman's socket:
 
     systemctl --user enable --now podman.socket
-    export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+    export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
     cargo test --test portability
 
 The tests pull `docker.io/library/postgres:14` and `:18` on first run.
@@ -1655,7 +1655,7 @@ async fn a_role_without_pg_monitor_is_classified_as_limited() {
 - [ ] **Step 4: Run the tests**
 
 ```bash
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 cargo test --test portability 2>&1 | tail -20
 ```
 
@@ -4018,7 +4018,7 @@ secret-tool search service mission-centre-pg 2>&1 | head -5
 ```bash
 cargo fmt --check
 cargo test --lib
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 cargo test --test portability
 git add -A
 git commit -m "feat: wire the window to the collector, completing Phase 1"
