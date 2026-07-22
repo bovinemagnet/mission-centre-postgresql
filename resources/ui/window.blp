@@ -6,14 +6,67 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
   default-width: 1100;
   default-height: 700;
 
-  content: Adw.ToolbarView {
-    [top]
-    Adw.HeaderBar {}
+  content: Adw.NavigationSplitView split_view {
+    sidebar: Adw.NavigationPage {
+      title: _("Servers");
 
-    content: Adw.StatusPage {
-      icon-name: "network-server-symbolic";
-      title: _("No server selected");
-      description: _("Add a server to begin monitoring.");
+      child: Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          [end]
+          Gtk.Button add_server_button {
+            icon-name: "list-add-symbolic";
+            tooltip-text: _("Add Server");
+          }
+        }
+
+        content: Gtk.ScrolledWindow {
+          child: Gtk.ListBox server_list {
+            selection-mode: single;
+            styles ["navigation-sidebar"]
+          };
+        };
+      };
+    };
+
+    content: Adw.NavigationPage {
+      title: _("Monitor");
+
+      child: Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          title-widget: Adw.ViewSwitcher {
+            stack: view_stack;
+            policy: wide;
+          };
+        }
+
+        [top]
+        Adw.Banner privilege_banner {
+          revealed: false;
+        }
+
+        [top]
+        Adw.Banner error_banner {
+          revealed: false;
+        }
+
+        content: Adw.ViewStack view_stack {
+          Adw.ViewStackPage {
+            name: "overview";
+            title: _("Overview");
+            icon-name: "utilities-system-monitor-symbolic";
+            child: $McpgOverviewPage overview_page {};
+          }
+
+          Adw.ViewStackPage {
+            name: "sessions";
+            title: _("Sessions");
+            icon-name: "view-list-symbolic";
+            child: $McpgSessionsPage sessions_page {};
+          }
+        };
+      };
     };
   };
 }
