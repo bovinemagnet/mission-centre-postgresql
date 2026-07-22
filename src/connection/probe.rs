@@ -62,6 +62,15 @@ pub struct ServerInfo {
     pub privilege: PrivilegeLevel,
 }
 
+impl ServerInfo {
+    /// True when the server predates the supported floor. Callers warn; they
+    /// never refuse the connection — pages that need a newer server gate
+    /// themselves.
+    pub fn is_below_floor(&self) -> bool {
+        self.version_num < MIN_SUPPORTED_VERSION
+    }
+}
+
 /// PostgreSQL 10 and later encode the version as MMmmmm: major * 10000 + minor.
 pub fn format_version(version_num: i32) -> String {
     format!("{}.{}", version_num / 10000, version_num % 10000)
@@ -121,8 +130,26 @@ mod tests {
     }
 
     #[test]
-    fn recognises_versions_below_the_floor() {
-        assert!(130015 < MIN_SUPPORTED_VERSION);
-        assert!(140000 >= MIN_SUPPORTED_VERSION);
+    fn recognises_a_server_below_the_supported_floor() {
+        let server_13 = ServerInfo {
+            version_num: 130015,
+            version_display: format_version(130015),
+            privilege: PrivilegeLevel::Superuser,
+        };
+        assert!(server_13.is_below_floor());
+
+        let server_14 = ServerInfo {
+            version_num: 140000,
+            version_display: format_version(140000),
+            privilege: PrivilegeLevel::Superuser,
+        };
+        assert!(!server_14.is_below_floor());
+
+        let server_18 = ServerInfo {
+            version_num: 180000,
+            version_display: format_version(180000),
+            privilege: PrivilegeLevel::Superuser,
+        };
+        assert!(!server_18.is_below_floor());
     }
 }
