@@ -32,17 +32,22 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 
-async fn connect(
-    tag: &str,
-) -> (
-    tokio_postgres::Client,
-    testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
+async fn start_container(tag: &str) -> testcontainers::ContainerAsync<Postgres> {
+    Postgres::default()
         .with_tag(tag)
         .start()
         .await
-        .expect("failed to start the PostgreSQL container");
+        .expect("failed to start the PostgreSQL container")
+}
+
+/// Opens a connection to an already-running container as the given role.
+/// Kept separate from `connect` so a second, differently-authenticated
+/// connection can be opened against the same container.
+async fn connect_as(
+    container: &testcontainers::ContainerAsync<Postgres>,
+    user: &str,
+    password: &str,
+) -> tokio_postgres::Client {
     let port = container
         .get_host_port_ipv4(5432)
         .await
@@ -51,8 +56,8 @@ async fn connect(
     let (client, connection) = tokio_postgres::Config::new()
         .host("127.0.0.1")
         .port(port)
-        .user("postgres")
-        .password("postgres")
+        .user(user)
+        .password(password)
         .dbname("postgres")
         .connect(tokio_postgres::NoTls)
         .await
@@ -62,6 +67,17 @@ async fn connect(
         let _ = connection.await;
     });
 
+    client
+}
+
+async fn connect(
+    tag: &str,
+) -> (
+    tokio_postgres::Client,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = start_container(tag).await;
+    let client = connect_as(&container, "postgres", "postgres").await;
     (client, container)
 }
 
@@ -100,8 +116,13 @@ async fn assert_all_statements_run(tag: &str) {
         .query(ACTIVITY_SQL, &[])
         .await
         .expect("pg_stat_activity query failed");
+    assert!(!rows.is_empty(), "pg_stat_activity returned no rows");
     let sessions: Vec<_> = rows.iter().map(map_session).collect();
-    let _ = count_sessions(&sessions);
+    let counts = count_sessions(&sessions);
+    assert!(
+        counts.total() > 0,
+        "expected at least one session, since the test's own connection is one"
+    );
 
     let row = client
         .query_one(SETTINGS_SQL, &[])
@@ -129,7 +150,7 @@ async fn all_statements_run_on_postgres_18() {
 
 #[tokio::test]
 async fn a_role_without_pg_monitor_is_classified_as_limited() {
-    let (client, _container) = connect("18").await;
+    let (client, container) = connect("18").await;
     client
         .batch_execute("CREATE ROLE watcher LOGIN PASSWORD 'watcher'")
         .await
@@ -148,5 +169,20 @@ async fn a_role_without_pg_monitor_is_classified_as_limited() {
     assert_eq!(
         PrivilegeLevel::classify(is_superuser, is_monitor),
         PrivilegeLevel::Limited
+    );
+
+    // The assertion above only exercises `classify` against hand-rolled
+    // booleans. Prove it for real: connect as `watcher` and run the
+    // production PROBE_SQL through that restricted connection.
+    let watcher_client = connect_as(&container, "watcher", "watcher").await;
+    let probe = watcher_client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed when authenticated as watcher");
+    let info = map_server_info(&probe);
+    assert_eq!(
+        info.privilege,
+        PrivilegeLevel::Limited,
+        "watcher should be classified as limited when probing over its own connection"
     );
 }
