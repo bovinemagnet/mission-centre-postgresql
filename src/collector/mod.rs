@@ -1,4 +1,4 @@
-/* lib.rs
+/* mod.rs
  *
  * Copyright 2026 Paul Snow
  *
@@ -18,5 +18,5 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-pub mod collector;
-pub mod i18n;
+pub mod rates;
+pub mod snapshot;
