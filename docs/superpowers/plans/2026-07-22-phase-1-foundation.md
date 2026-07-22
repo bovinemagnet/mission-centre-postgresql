@@ -3170,9 +3170,9 @@ impl Default for McpgOverviewPage {
 }
 ```
 
-If blueprint-compiler rejects `$GraphWidget` in the template, use the same fallback as Task 9:
-plain `Gtk.Box` placeholders in the `.blp`, and append `GraphWidget`s from Rust in
-`constructed()`. Whichever route Task 9 took, take the same one here.
+Task 9 established that blueprint-compiler accepts `$GraphWidget` directly in a template — the
+generated `.ui` carries `<object class="GraphWidget" id="...">` — provided `GraphWidget::ensure_type()`
+runs in `class_init`. Use that route; no `Gtk.Box` fallback is needed.
 
 - [ ] **Step 7: Write `resources/ui/sessions_page.blp`**
 
