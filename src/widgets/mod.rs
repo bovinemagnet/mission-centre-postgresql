@@ -1,4 +1,4 @@
-/* lib.rs
+/* widgets/mod.rs
  *
  * Copyright 2026 Paul Snow
  *
@@ -18,7 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-pub mod collector;
-pub mod connection;
-pub mod i18n;
-pub mod widgets;
+pub mod graph_widget;
+pub mod graph_widget_utils;
+
+pub use graph_widget::GraphWidget;

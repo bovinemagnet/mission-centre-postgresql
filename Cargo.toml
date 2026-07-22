@@ -41,7 +41,7 @@ features = ["v1_5"]
 [dependencies.gtk]
 package = "gtk4"
 version = "0.11"
-features = ["v4_12"]
+features = ["v4_14"]
 
 [dev-dependencies]
 testcontainers = "0.27"
