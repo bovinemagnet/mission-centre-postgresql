@@ -18,6 +18,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -42,7 +44,7 @@ impl SslMode {
 /// Everything needed to reach a server *except* the password, which lives in
 /// the system secret store. This type is serialised into GSettings, so it must
 /// never gain a password field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionParams {
     pub id: Uuid,
     pub label: String,
@@ -51,6 +53,25 @@ pub struct ConnectionParams {
     pub database: String,
     pub user: String,
     pub ssl_mode: SslMode,
+}
+
+/// Manual Debug implementation to prevent accidentally including any future
+/// password-like field. A derived Debug would automatically include new fields,
+/// which would be catastrophic since this struct is serialised into GSettings
+/// (plain text). By hand-writing Debug, we fail closed: if someone adds a
+/// password field, its omission from the debug output is visible in review.
+impl fmt::Debug for ConnectionParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionParams")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("ssl_mode", &self.ssl_mode)
+            .finish()
+    }
 }
 
 impl ConnectionParams {
@@ -117,5 +138,13 @@ mod tests {
         // so debugging the params can never expose it.
         let rendered = format!("{:?}", params());
         assert!(!rendered.contains("hunter2"));
+    }
+
+    #[test]
+    fn debug_output_lists_only_the_known_fields() {
+        let rendered = format!("{:?}", params());
+        assert!(rendered.contains("ConnectionParams"));
+        assert!(rendered.contains("prod")); // the label
+        assert!(rendered.contains("db.example.com")); // the host
     }
 }
