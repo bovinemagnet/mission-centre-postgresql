@@ -2,5 +2,6 @@
 <gresources>
   <gresource prefix="/io/github/paulsnow/MissionCentrePg">
     <file preprocess="xml-stripblanks">ui/window.ui</file>
+    <file preprocess="xml-stripblanks">ui/sidebar_row.ui</file>
   </gresource>
 </gresources>

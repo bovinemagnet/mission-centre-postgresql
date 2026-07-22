@@ -1,0 +1,35 @@
+using Gtk 4.0;
+
+template $McpgSidebarRow: Gtk.Box {
+  orientation: horizontal;
+  spacing: 12;
+
+  Gtk.Image state_icon {
+    icon-name: "media-playback-stop-symbolic";
+    valign: center;
+  }
+
+  Gtk.Box {
+    orientation: vertical;
+    hexpand: true;
+    valign: center;
+
+    Gtk.Label heading_label {
+      xalign: 0;
+      ellipsize: end;
+      styles ["heading"]
+    }
+
+    Gtk.Label subheading_label {
+      xalign: 0;
+      ellipsize: end;
+      styles ["caption", "dim-label"]
+    }
+  }
+
+  $GraphWidget graph {
+    width-request: 72;
+    height-request: 28;
+    valign: center;
+  }
+}

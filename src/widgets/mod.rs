@@ -20,5 +20,7 @@
 
 pub mod graph_widget;
 pub mod graph_widget_utils;
+pub mod sidebar_row;
 
 pub use graph_widget::GraphWidget;
+pub use sidebar_row::{ConnectionState, McpgSidebarRow};
