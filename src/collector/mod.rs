@@ -21,3 +21,4 @@
 pub mod queries;
 pub mod rates;
 pub mod snapshot;
+pub mod worker;
