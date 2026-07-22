@@ -137,7 +137,7 @@ name = "mission-centre-pg"
 path = "src/main.rs"
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_12"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 tokio = { version = "1.53", features = ["rt", "time", "macros", "sync"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
@@ -176,7 +176,7 @@ gnome = import('gnome')
 
 app_id = 'io.github.paulsnow.MissionCentrePg'
 
-dependency('gtk4', version: '>= 4.12')
+dependency('gtk4', version: '>= 4.14')
 dependency('libadwaita-1', version: '>= 1.5')
 
 cargo = find_program('cargo', required: true)

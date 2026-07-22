@@ -9,7 +9,7 @@ gnome = import('gnome')
 
 app_id = 'io.github.paulsnow.MissionCentrePg'
 
-dependency('gtk4', version: '>= 4.12')
+dependency('gtk4', version: '>= 4.14')
 dependency('libadwaita-1', version: '>= 1.5')
 
 cargo = find_program('cargo', required: true)
