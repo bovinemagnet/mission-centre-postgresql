@@ -1785,7 +1785,8 @@ impl CollectorHandle {
 
 /// 1s, 2s, 4s, 8s, 16s, then 30s for ever.
 pub fn backoff_delay(consecutive_failures: u32) -> Duration {
-    let seconds = 1u64.saturating_shl(consecutive_failures.min(16));
+    // saturating_shl is not a stable integer method; min() already bounds the shift.
+    let seconds = 1u64 << consecutive_failures.min(16);
     Duration::from_secs(seconds.min(30))
 }
 
