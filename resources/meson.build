@@ -1,6 +1,12 @@
 blueprints = custom_target(
   'blueprints',
-  input: files('ui/window.blp', 'ui/sidebar_row.blp', 'ui/add_server_dialog.blp'),
+  input: files(
+    'ui/window.blp',
+    'ui/sidebar_row.blp',
+    'ui/add_server_dialog.blp',
+    'ui/overview_page.blp',
+    'ui/sessions_page.blp',
+  ),
   output: '.',
   command: [blueprint_compiler, 'batch-compile', '@OUTPUT@', '@CURRENT_SOURCE_DIR@', '@INPUT@'],
 )

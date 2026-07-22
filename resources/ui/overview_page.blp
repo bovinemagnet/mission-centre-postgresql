@@ -1,0 +1,94 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgOverviewPage: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.ScrolledWindow {
+    vexpand: true;
+    hscrollbar-policy: never;
+
+    child: Adw.Clamp {
+      maximum-size: 900;
+      margin-start: 18;
+      margin-end: 18;
+      margin-top: 18;
+      margin-bottom: 18;
+
+      child: Gtk.Box {
+        orientation: vertical;
+        spacing: 24;
+
+        Gtk.Box {
+          orientation: vertical;
+          spacing: 6;
+
+          Gtk.Box {
+            Gtk.Label { label: _("Connections"); xalign: 0; hexpand: true; styles ["heading"] }
+            Gtk.Label connections_value { xalign: 1; styles ["numeric"] }
+          }
+
+          $GraphWidget connections_graph { height-request: 120; }
+        }
+
+        Gtk.Box {
+          orientation: vertical;
+          spacing: 6;
+
+          Gtk.Box {
+            Gtk.Label { label: _("Transactions per second"); xalign: 0; hexpand: true; styles ["heading"] }
+            Gtk.Label tps_value { xalign: 1; styles ["numeric"] }
+          }
+
+          $GraphWidget tps_graph { height-request: 120; }
+        }
+
+        Gtk.Box {
+          orientation: vertical;
+          spacing: 6;
+
+          Gtk.Box {
+            Gtk.Label { label: _("Cache hit ratio"); xalign: 0; hexpand: true; styles ["heading"] }
+            Gtk.Label cache_value { xalign: 1; styles ["numeric"] }
+          }
+
+          $GraphWidget cache_graph { height-request: 120; }
+        }
+
+        Gtk.Box {
+          orientation: vertical;
+          spacing: 6;
+
+          Gtk.Box {
+            Gtk.Label { label: _("Tuples returned per second"); xalign: 0; hexpand: true; styles ["heading"] }
+            Gtk.Label tuples_value { xalign: 1; styles ["numeric"] }
+          }
+
+          $GraphWidget tuples_graph { height-request: 120; }
+        }
+
+        Adw.PreferencesGroup {
+          title: _("Server");
+
+          Adw.ActionRow database_size_row {
+            title: _("Database size");
+            [suffix]
+            Gtk.Label database_size_value { styles ["numeric", "dim-label"] }
+          }
+
+          Adw.ActionRow deadlocks_row {
+            title: _("Deadlocks per second");
+            [suffix]
+            Gtk.Label deadlocks_value { styles ["numeric", "dim-label"] }
+          }
+
+          Adw.ActionRow temp_row {
+            title: _("Temporary bytes per second");
+            [suffix]
+            Gtk.Label temp_value { styles ["numeric", "dim-label"] }
+          }
+        }
+      };
+    };
+  }
+}

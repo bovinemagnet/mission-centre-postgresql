@@ -1,0 +1,38 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgSessionsPage: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Box {
+    spacing: 12;
+    margin-start: 12;
+    margin-end: 12;
+    margin-top: 12;
+    margin-bottom: 6;
+
+    Gtk.SearchEntry filter_entry {
+      hexpand: true;
+      placeholder-text: _("Filter by user, database, application or query");
+    }
+
+    Gtk.ToggleButton hide_idle_toggle {
+      label: _("Hide idle");
+      active: true;
+    }
+  }
+
+  Adw.Banner privilege_note {
+    revealed: false;
+    title: _("Query text for other users' sessions is hidden without pg_monitor.");
+  }
+
+  Gtk.ScrolledWindow {
+    vexpand: true;
+
+    child: Gtk.ColumnView column_view {
+      show-column-separators: true;
+      reorderable: false;
+    };
+  }
+}
