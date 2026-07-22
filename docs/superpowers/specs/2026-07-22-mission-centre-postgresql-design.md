@@ -135,9 +135,9 @@ src/
     sessions.rs        pg_stat_activity table
 
   widgets/
-    graph_widget.rs        vendored from Mission Center
-    graph_widget_utils.rs  vendored from Mission Center
-    summary_graph.rs       vendored from Mission Center
+    graph_widget.rs        vendored from Mission Center (verbatim)
+    graph_widget_utils.rs  vendored from Mission Center (two edits, see §9)
+    sidebar_row.rs         ours: sparkline row composing GraphWidget
 
   table/
     mod.rs             ColumnView-based table, modelled on Mission Center's but our own types
@@ -250,7 +250,13 @@ Version gating is required regardless — 16, 17 and 18 each add views later pha
 refusal would be the wrong failure for a tool whose purpose is meeting whatever server is in front of
 it, and page-level gating stops the floor creeping every time a page is added.
 
-`probe.rs` reads `server_version_num` once at connect; each query module exposes `sql_for(version)`.
+`probe.rs` reads `server_version_num` once at connect and stores it on `ServerInfo`.
+
+**Phase 1 needs no per-version SQL.** Every column Phase 1 consumes from `pg_stat_database` and
+`pg_stat_activity` is present and unchanged across 14 through 18, so each query module holds a single
+`&'static str`. Building a `sql_for(version)` selector now would be machinery that always returns the
+same string. It arrives in Phase 2 or later, at the first page that genuinely branches — and the
+integration tests against 14 and 18 (§10) are what prove the single statement really is portable.
 
 ---
 
@@ -294,8 +300,8 @@ across page switches. The same probe result gates the Phase 4 action buttons.
 
 `AdwApplicationWindow` → `AdwNavigationSplitView`, sidebar left, page stack right.
 
-- **Sidebar rows carry live sparklines** via the vendored `SummaryGraph` — the visual signature the
-  project is after.
+- **Sidebar rows carry live sparklines** via `SidebarRow`, our own thin wrapper composing the
+  vendored `GraphWidget` (§9) — the visual signature the project is after.
 - **Connection state shows per server**: ● connected, ○ disconnected, ⟳ connecting, ⚠ error. Because
   Phase 1 polls only the selected server, the others honestly show as disconnected rather than
   implying live data.
@@ -332,19 +338,26 @@ server's fault.
 
 ## 9. Vendored code and attribution
 
-Three files are copied from Mission Center substantially unmodified:
+Two files are copied from Mission Center, taken from commit `050213c`:
 
-- `src/performance_page/widgets/graph_widget.rs` — verified free of any `magpie` coupling; pure
-  GTK/GSK
-- `src/performance_page/widgets/graph_widget_utils.rs`
-- `src/performance_page/summary_graph.rs`
+| File | Lines | State |
+|------|-------|-------|
+| `src/performance_page/widgets/graph_widget.rs` | 777 | Verbatim. Verified free of any `magpie` or crate-local coupling; pure GTK/GSK |
+| `src/performance_page/widgets/graph_widget_utils.rs` | 722 | Two edits only: define `MAX_POINTS = 600` and `MIN_POINTS = 10` locally (they come from `crate::preferences` upstream), and adjust the `GraphWidget` import path |
 
-Each retains its original copyright header, with an added note recording the upstream project,
-the source path and the commit it was taken from. `README.md` credits Mission Center. The project
-licence is GPL-3.0-or-later, as required.
+Each retains its original copyright header, with an added note recording the upstream project, the
+source path and the commit it was taken from. `README.md` credits Mission Center. The project licence
+is GPL-3.0-or-later, as required.
 
-Mission Center's `src/table_view/` is **not** vendored: it is coupled to `magpie` types through
-`models.rs` and `mod.rs`. It serves as a reference for the column architecture only.
+**`summary_graph.rs` is *not* vendored.** Inspection showed it is not the clean lift it appears to
+be: it depends on `magpie_types::network::ConnectionKind` (a `DeviceType::from_connection_kind`
+constructor), on `crate::settings`, and on `SidebarDropHint` — a further 143 lines implementing
+drag-and-drop sidebar reordering that Phase 1 does not want. Stripping those out of 413 lines leaves
+little worth inheriting. We instead write our own `SidebarRow` (§7) that composes the vendored
+`GraphWidget` directly, which is both smaller and free of foreign coupling.
+
+Mission Center's `src/table_view/` is likewise **not** vendored: it is coupled to `magpie` types
+through `models.rs` and `mod.rs`. It serves as a reference for the column architecture only.
 
 ---
 
