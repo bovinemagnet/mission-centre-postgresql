@@ -1,0 +1,19 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $MissionCentrePgWindow: Adw.ApplicationWindow {
+  title: _("Mission Centre PostgreSQL");
+  default-width: 1100;
+  default-height: 700;
+
+  content: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {}
+
+    content: Adw.StatusPage {
+      icon-name: "network-server-symbolic";
+      title: _("No server selected");
+      description: _("Add a server to begin monitoring.");
+    };
+  };
+}
