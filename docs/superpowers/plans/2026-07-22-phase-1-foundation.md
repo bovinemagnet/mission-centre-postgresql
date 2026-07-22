@@ -28,6 +28,24 @@ Every task's requirements implicitly include this section.
 - **Rates are per-interval deltas**, never cumulative-since-reset.
 - **App ID:** `io.github.paulsnow.MissionCentrePg`. **Binary:** `mission-centre-pg`.
 
+### Conventions established by Task 1 (later tasks must follow)
+
+- **Cargo renames the GTK crates.** `Cargo.toml` uses `[dependencies.gtk] package = "gtk4"`
+  and `[dependencies.adw] package = "libadwaita"`, so all Rust code says `gtk::` and `adw::`.
+- **`keyring` features are `dbus-secret-service-keyring-store` and
+  `apple-native-keyring-store`.** The `-native` names in earlier drafts do not exist in keyring
+  4.1. The dbus/Secret Service backend is the correct choice: credentials must survive a reboot,
+  and `linux-keyutils-keyring-store` is an ephemeral kernel keyring that does not. Task 13
+  Step 5 verifies with `secret-tool`, which queries Secret Service.
+- **`glib::wrapper!` blocks for `CompositeTemplate` widgets must list the widget interfaces** —
+  at minimum `gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget`, plus `gtk::Native,
+  gtk::Root, gtk::ShortcutManager` for windows. The derive macro requires them.
+- **`gnome.compile_resources()` needs `gresource_bundle: true`**, and blueprint-compiler's
+  `batch-compile` takes `@CURRENT_SOURCE_DIR@` (not `@CURRENT_SOURCE_DIR@/ui`) as its source
+  directory, so output lands at `ui/<name>.ui` where the gresource manifest expects it.
+- **`.gitignore` carries `!/build-aux/`** immediately after `/build-*/`, which would otherwise
+  exclude the cargo shim.
+
 ### Verified environment (this machine, Garuda/Arch)
 
 | Tool | State |
@@ -3808,7 +3826,8 @@ mod imp {
 glib::wrapper! {
     pub struct MissionCentrePgWindow(ObjectSubclass<imp::MissionCentrePgWindow>)
         @extends adw::ApplicationWindow, gtk::ApplicationWindow, gtk::Window, gtk::Widget,
-        @implements gio::ActionGroup, gio::ActionMap;
+        @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
+                    gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
 impl MissionCentrePgWindow {
