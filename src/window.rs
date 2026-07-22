@@ -18,7 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -58,6 +58,15 @@ mod imp {
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
         pub collector: RefCell<Option<CollectorHandle>>,
+        /// Bumped on every `select_server` call and captured by the spawned
+        /// event loop, so events from a superseded collector can be told
+        /// apart from events belonging to the currently selected one.
+        pub generation: Cell<u64>,
+        /// Set while `reload_servers` is restoring the selection it
+        /// remembered, so the `row-selected` handler does not treat that
+        /// restoration as a user pick and reconnect an already-healthy
+        /// collector.
+        pub restoring_selection: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -94,6 +103,9 @@ mod imp {
 
             let window = self.obj().clone();
             self.server_list.connect_row_selected(move |_, row| {
+                if window.imp().restoring_selection.get() {
+                    return;
+                }
                 if let Some(row) = row {
                     window.select_server(row.index());
                 }
@@ -116,6 +128,13 @@ glib::wrapper! {
                     gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
+/// Events from a superseded collector must be discarded: the old thread keeps
+/// draining for a moment after `stop()`, and its final `Disconnected` would
+/// otherwise be applied to whichever server is now selected.
+fn is_current(event_generation: u64, current_generation: u64) -> bool {
+    event_generation == current_generation
+}
+
 impl MissionCentrePgWindow {
     pub fn new(app: &impl IsA<gtk::Application>) -> Self {
         glib::Object::builder().property("application", app).build()
@@ -133,18 +152,45 @@ impl MissionCentrePgWindow {
         let imp = self.imp();
         let servers = registry::load(&self.settings());
 
+        // A still-connected server's collector keeps running untouched
+        // through a reload; losing its selection here would strand the user
+        // on no row while the pages keep updating underneath them. Remember
+        // it by id so the selection can be restored after the rebuild below
+        // without disturbing that collector.
+        let selected_id = imp
+            .server_list
+            .selected_row()
+            .map(|row| row.index())
+            .and_then(|index| imp.servers.borrow().get(index as usize).map(|p| p.id));
+
         while let Some(child) = imp.server_list.first_child() {
             imp.server_list.remove(&child);
         }
 
-        for server in &servers {
+        let mut restore_index = None;
+        for (i, server) in servers.iter().enumerate() {
             let row = McpgSidebarRow::new(&server.label);
             row.set_subheading(&format!("{}:{}", server.host, server.port));
             row.set_state(ConnectionState::Disconnected);
             imp.server_list.append(&row);
+            if Some(server.id) == selected_id {
+                restore_index = Some(i as i32);
+            }
         }
 
         imp.servers.replace(servers);
+
+        // Restore the selection without going through `select_server`: the
+        // collector for this server is still running and connected, and
+        // re-selecting it must not reconnect a healthy connection just
+        // because an unrelated server was added.
+        if let Some(index) = restore_index {
+            if let Some(row) = imp.server_list.row_at_index(index) {
+                imp.restoring_selection.set(true);
+                imp.server_list.select_row(Some(&row));
+                imp.restoring_selection.set(false);
+            }
+        }
     }
 
     fn present_add_server_dialog(&self) {
@@ -164,6 +210,12 @@ impl MissionCentrePgWindow {
     fn select_server(&self, index: i32) {
         let imp = self.imp();
 
+        // Neither banner belongs to the server about to be selected: leaving
+        // them set would let a limited-privilege server's banner survive
+        // onto a server that fails to connect entirely.
+        imp.privilege_banner.set_revealed(false);
+        imp.sessions_page.set_privilege_limited(false);
+
         if let Some(handle) = imp.collector.take() {
             handle.stop();
         }
@@ -180,14 +232,29 @@ impl MissionCentrePgWindow {
             row.reset_series();
         }
 
-        let password = credentials::fetch_password(&params.id)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let password = match credentials::fetch_password(&params.id) {
+            Ok(password) => password.unwrap_or_default(),
+            Err(e) => {
+                // `Ok(None)` (no password stored) is a normal case and stays
+                // quiet; this arm is reached only for an unreadable secret
+                // store, which the user otherwise has no way to learn about.
+                gtk::glib::g_warning!(
+                    "mission-centre-pg",
+                    "could not read the stored password, continuing without one: {e}"
+                );
+                String::new()
+            }
+        };
 
         let interval = std::time::Duration::from_millis(
             self.settings().int("sample-interval-ms").max(500) as u64,
         );
+
+        // Every event this collector ever emits is stamped with this
+        // generation; the event loop below discards anything that arrives
+        // after a later `select_server` call has moved the generation on.
+        let generation = imp.generation.get().saturating_add(1);
+        imp.generation.set(generation);
 
         let handle = spawn(params, password, interval);
         let events = handle.events.clone();
@@ -196,6 +263,12 @@ impl MissionCentrePgWindow {
         let window = self.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
+                if !is_current(generation, window.imp().generation.get()) {
+                    // Superseded: the collector that sent this has already
+                    // been told to stop, so stop draining for it too rather
+                    // than spin until its channel closes.
+                    break;
+                }
                 window.handle_event(event);
             }
         });
@@ -266,5 +339,26 @@ impl MissionCentrePgWindow {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_current_when_the_generation_matches() {
+        assert!(is_current(3, 3));
+    }
+
+    #[test]
+    fn is_stale_when_the_generation_is_older_than_current() {
+        assert!(!is_current(1, 2));
+    }
+
+    #[test]
+    fn is_current_at_generation_zero() {
+        // The window's initial generation before any `select_server` call.
+        assert!(is_current(0, 0));
     }
 }
