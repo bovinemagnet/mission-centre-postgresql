@@ -20,7 +20,7 @@
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use crate::collector::snapshot::Snapshot;
 use crate::i18n::i18n_f;
@@ -29,6 +29,17 @@ use crate::widgets::graph_widget::GraphWidget;
 use crate::widgets::graph_widget_utils::DatasetGroup;
 
 const DEFAULT_POINTS: u32 = 300;
+
+/// A distinct base colour per graph, in the order `graphs()` returns them:
+/// connections (blue), transactions (green), cache hit (purple), tuples
+/// (orange). Without a base colour the widget draws in black, which is
+/// invisible on a dark background.
+const GRAPH_COLOURS: [(f32, f32, f32); 4] = [
+    (0.30, 0.56, 0.90),
+    (0.28, 0.76, 0.44),
+    (0.68, 0.44, 0.90),
+    (0.95, 0.60, 0.20),
+];
 
 mod imp {
     use super::*;
@@ -79,9 +90,10 @@ mod imp {
     impl ObjectImpl for McpgOverviewPage {
         fn constructed(&self) {
             self.parent_constructed();
-            for graph in self.obj().graphs() {
+            for (graph, &(r, g, b)) in self.obj().graphs().iter().zip(GRAPH_COLOURS.iter()) {
                 graph.set_data_points(DEFAULT_POINTS);
                 graph.add_dataset(DatasetGroup::new());
+                graph.set_base_color(gdk::RGBA::new(r, g, b, 1.0));
             }
             // A ratio is always 0-100, so pin the scale rather than letting it
             // auto-fit and make a flat 99% line look dramatic.

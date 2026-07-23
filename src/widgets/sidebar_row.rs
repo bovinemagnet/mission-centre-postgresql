@@ -18,9 +18,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use gtk::{gdk, glib};
 
 use crate::widgets::graph_widget::GraphWidget;
 use crate::widgets::graph_widget_utils::DatasetGroup;
@@ -86,6 +86,10 @@ mod imp {
             self.parent_constructed();
             self.graph.set_data_points(SPARKLINE_POINTS);
             self.graph.add_dataset(DatasetGroup::new());
+            // Accent blue, so the sparkline reads against the dark sidebar
+            // rather than drawing in the default invisible black.
+            self.graph
+                .set_base_color(gdk::RGBA::new(0.30, 0.56, 0.90, 1.0));
         }
     }
 
