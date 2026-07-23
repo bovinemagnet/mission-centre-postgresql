@@ -67,6 +67,11 @@ mod imp {
         /// restoration as a user pick and reconnect an already-healthy
         /// collector.
         pub restoring_selection: Cell<bool>,
+        /// The below-floor warning for the connected server, if any. Unlike a
+        /// transient error it describes a permanent property of the server, so
+        /// it is re-asserted after each successful `Sample` rather than being
+        /// cleared. Reset to `None` on a server switch or a fresh connection.
+        pub below_floor_warning: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -215,6 +220,9 @@ impl MissionCentrePgWindow {
         // onto a server that fails to connect entirely.
         imp.privilege_banner.set_revealed(false);
         imp.sessions_page.set_privilege_limited(false);
+        // The below-floor warning belongs to the previously connected server;
+        // clear it so it cannot survive onto the server about to be selected.
+        imp.below_floor_warning.replace(None);
 
         if let Some(handle) = imp.collector.take() {
             handle.stop();
@@ -310,15 +318,28 @@ impl MissionCentrePgWindow {
                 imp.sessions_page.set_privilege_limited(limited);
 
                 if info.is_below_floor() {
-                    imp.error_banner.set_revealed(true);
-                    imp.error_banner.set_title(&i18n_f(
+                    let message = i18n_f(
                         "PostgreSQL {} is older than the supported floor of 14. Some statistics may be missing.",
                         &[&info.version_display],
-                    ));
+                    );
+                    imp.error_banner.set_revealed(true);
+                    imp.error_banner.set_title(&message);
+                    imp.below_floor_warning.replace(Some(message));
+                } else {
+                    imp.below_floor_warning.replace(None);
                 }
             }
             CollectorEvent::Sample(snapshot) => {
-                imp.error_banner.set_revealed(false);
+                // A successful sample clears a transient error, but must not
+                // clear the below-floor warning, which is a permanent property
+                // of the connected server; re-assert it instead.
+                match imp.below_floor_warning.borrow().as_ref() {
+                    Some(message) => {
+                        imp.error_banner.set_revealed(true);
+                        imp.error_banner.set_title(message);
+                    }
+                    None => imp.error_banner.set_revealed(false),
+                }
                 imp.overview_page.update(&snapshot);
                 imp.sessions_page.update(&snapshot.sessions);
                 if let Some(row) = self.selected_row() {
@@ -328,7 +349,7 @@ impl MissionCentrePgWindow {
             }
             CollectorEvent::Error(error) => {
                 imp.error_banner.set_revealed(true);
-                imp.error_banner.set_title(&error.to_string());
+                imp.error_banner.set_title(&i18n(&error.to_string()));
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Failed);
                 }
