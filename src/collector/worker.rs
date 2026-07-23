@@ -18,9 +18,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use tokio_postgres::{error::SqlState, Client};
+use rustls::RootCertStore;
+use tokio_postgres::tls::MakeTlsConnect;
+use tokio_postgres::{error::SqlState, Client, NoTls, Socket};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
@@ -28,7 +32,7 @@ use crate::collector::queries::{
 };
 use crate::collector::rates::derive_rates;
 use crate::collector::snapshot::{DatabaseCounters, ServerSettings, Snapshot};
-use crate::connection::params::ConnectionParams;
+use crate::connection::params::{ConnectionParams, SslMode};
 use crate::connection::probe::{map_server_info, ServerInfo, PROBE_SQL};
 
 /// Guards against a wedged server hanging the sampler for ever.
@@ -220,8 +224,33 @@ async fn connect(
 ) -> Result<(Client, ServerInfo), CollectorError> {
     let config = params.to_config(password);
 
+    // Only the connector differs between the TLS and non-TLS paths; the probe
+    // and connection-driver setup are shared in `establish`. `to_config` has
+    // already stamped the tokio-postgres `SslMode` onto `config`, so for
+    // `Require` tokio-postgres itself rejects a server that refuses TLS, and
+    // for `Prefer` it falls back to plaintext when the server has no TLS.
+    match params.ssl_mode {
+        SslMode::Disable => establish(&config, NoTls).await,
+        SslMode::Prefer | SslMode::Require => {
+            let connector = rustls_connector()?;
+            establish(&config, connector).await
+        }
+    }
+}
+
+/// Shared connect-and-probe path, generic over the TLS connector so the two
+/// arms of `connect` share the probe and the connection-driver spawn rather
+/// than duplicating the sampling setup.
+async fn establish<T>(
+    config: &tokio_postgres::Config,
+    tls: T,
+) -> Result<(Client, ServerInfo), CollectorError>
+where
+    T: MakeTlsConnect<Socket>,
+    T::Stream: Send + 'static,
+{
     let (client, connection) = config
-        .connect(tokio_postgres::NoTls)
+        .connect(tls)
         .await
         .map_err(|e| CollectorError::Connect(e.to_string()))?;
 
@@ -240,6 +269,38 @@ async fn connect(
         .map_err(map_query_error)?;
 
     Ok((client, map_server_info(&row)))
+}
+
+/// Builds a rustls TLS connector trusting the platform's native root
+/// certificates. Used for both `Prefer` and `Require`; tokio-postgres decides
+/// from the `SslMode` on the `Config` whether TLS is mandatory or opportunistic.
+fn rustls_connector() -> Result<MakeRustlsConnect, CollectorError> {
+    install_crypto_provider();
+
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    roots.add_parsable_certificates(native.certs);
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(MakeRustlsConnect::new(client_config))
+}
+
+/// Installs a process-default rustls crypto provider exactly once. rustls 0.23
+/// requires a process-default provider before `ClientConfig::builder()` will
+/// work when more than one provider is compiled in; `aws_lc_rs` is rustls'
+/// default and is always available in this build. The `Once` keeps this off
+/// the global-static path, so it runs only when a TLS connection is first set
+/// up rather than at unpredictable start-up time.
+fn install_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // A failure here means another provider is already installed, which is
+        // fine: we only need *some* process-default provider to exist.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 /// Samples serially: the next sample starts only once the previous one has
