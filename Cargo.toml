@@ -1,0 +1,49 @@
+[package]
+name = "mission-centre-pg"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.90"
+authors = ["Paul Snow"]
+license = "GPL-3.0-or-later"
+description = "A GTK4 desktop monitor for PostgreSQL servers"
+
+# lib + bin from the start: the integration tests in Task 6 can only reach
+# library code, and the pages/widgets/dialogs modules need the i18n helpers.
+[lib]
+name = "mission_centre_pg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mission-centre-pg"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt", "time", "macros", "sync"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+tokio-postgres-rustls = "0.14"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+chrono = "0.4"
+keyring = { version = "4.1", features = ["dbus-secret-service-keyring-store", "apple-native-keyring-store"] }
+async-channel = "2.5"
+uuid = { version = "1.24", features = ["v4"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+thiserror = "2.0"
+futures-util = "0.3"
+
+[dependencies.adw]
+package = "libadwaita"
+version = "0.9"
+features = ["v1_5"]
+
+[dependencies.gtk]
+package = "gtk4"
+version = "0.11"
+features = ["v4_14"]
+
+[dev-dependencies]
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }

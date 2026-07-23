@@ -1,0 +1,63 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgAddServerDialog: Adw.Dialog {
+  title: _("Add Server");
+  content-width: 460;
+
+  child: Adw.ToastOverlay toast_overlay {
+    child: Adw.ToolbarView {
+      [top]
+      Adw.HeaderBar {
+        show-end-title-buttons: false;
+
+        [start]
+        Gtk.Button cancel_button {
+          label: _("Cancel");
+        }
+
+        [end]
+        Gtk.Button add_button {
+          label: _("Add");
+          styles ["suggested-action"]
+        }
+      }
+
+      content: Adw.PreferencesPage {
+        Adw.PreferencesGroup {
+          Adw.EntryRow label_row {
+            title: _("Name");
+          }
+
+          Adw.EntryRow host_row {
+            title: _("Host");
+          }
+
+          Adw.EntryRow port_row {
+            title: _("Port");
+          }
+
+          Adw.EntryRow database_row {
+            title: _("Database");
+          }
+
+          Adw.EntryRow user_row {
+            title: _("User");
+          }
+
+          Adw.PasswordEntryRow password_row {
+            title: _("Password");
+          }
+
+          Adw.ComboRow ssl_row {
+            title: _("SSL Mode");
+            model: Gtk.StringList {
+              strings [_("Disable"), _("Prefer"), _("Require")]
+            };
+            selected: 1;
+          }
+        }
+      };
+    };
+  };
+}

@@ -28,6 +28,24 @@ Every task's requirements implicitly include this section.
 - **Rates are per-interval deltas**, never cumulative-since-reset.
 - **App ID:** `io.github.paulsnow.MissionCentrePg`. **Binary:** `mission-centre-pg`.
 
+### Conventions established by Task 1 (later tasks must follow)
+
+- **Cargo renames the GTK crates.** `Cargo.toml` uses `[dependencies.gtk] package = "gtk4"`
+  and `[dependencies.adw] package = "libadwaita"`, so all Rust code says `gtk::` and `adw::`.
+- **`keyring` features are `dbus-secret-service-keyring-store` and
+  `apple-native-keyring-store`.** The `-native` names in earlier drafts do not exist in keyring
+  4.1. The dbus/Secret Service backend is the correct choice: credentials must survive a reboot,
+  and `linux-keyutils-keyring-store` is an ephemeral kernel keyring that does not. Task 13
+  Step 5 verifies with `secret-tool`, which queries Secret Service.
+- **`glib::wrapper!` blocks for `CompositeTemplate` widgets must list the widget interfaces** —
+  at minimum `gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget`, plus `gtk::Native,
+  gtk::Root, gtk::ShortcutManager` for windows. The derive macro requires them.
+- **`gnome.compile_resources()` needs `gresource_bundle: true`**, and blueprint-compiler's
+  `batch-compile` takes `@CURRENT_SOURCE_DIR@` (not `@CURRENT_SOURCE_DIR@/ui`) as its source
+  directory, so output lands at `ui/<name>.ui` where the gresource manifest expects it.
+- **`.gitignore` carries `!/build-aux/`** immediately after `/build-*/`, which would otherwise
+  exclude the cargo shim.
+
 ### Verified environment (this machine, Garuda/Arch)
 
 | Tool | State |
@@ -66,8 +84,7 @@ Every task's requirements implicitly include this section.
 | `src/collector/mod.rs` | Collector thread, tokio runtime, serial sample loop, backoff |
 | `src/widgets/graph_widget.rs` | Vendored from Mission Center, verbatim |
 | `src/widgets/graph_widget_utils.rs` | Vendored from Mission Center, two edits |
-| `src/widgets/sidebar_row.rs` | Ours: sparkline sidebar row composing `GraphWidget` |
-| `src/widgets/ring_buffer.rs` | Bounded series buffer feeding the graphs |
+| `src/widgets/sidebar_row.rs` | Ours: sparkline row composing `GraphWidget`, which owns its own buffer |
 | `src/pages/overview.rs` | Overview page |
 | `src/pages/sessions.rs` | Sessions `ColumnView` table |
 | `src/dialogs/add_server.rs` | Add Server dialog |
@@ -120,7 +137,7 @@ name = "mission-centre-pg"
 path = "src/main.rs"
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_12"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 tokio = { version = "1.53", features = ["rt", "time", "macros", "sync"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
@@ -159,7 +176,7 @@ gnome = import('gnome')
 
 app_id = 'io.github.paulsnow.MissionCentrePg'
 
-dependency('gtk4', version: '>= 4.12')
+dependency('gtk4', version: '>= 4.14')
 dependency('libadwaita-1', version: '>= 1.5')
 
 cargo = find_program('cargo', required: true)
@@ -781,7 +798,8 @@ impl SessionCounts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `query_duration_secs` is an f64.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub pid: i32,
     pub user_name: Option<String>,
@@ -1200,7 +1218,9 @@ impl SslMode {
 /// Everything needed to reach a server *except* the password, which lives in
 /// the system secret store. This type is serialised into GSettings, so it must
 /// never gain a password field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Debug is hand-written below, not derived: a derived Debug would
+// automatically print any field added later, including a password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionParams {
     pub id: Uuid,
     pub label: String,
@@ -1483,7 +1503,7 @@ Docker is not installed on this machine; podman is. `testcontainers` speaks the 
 
 ```bash
 systemctl --user enable --now podman.socket
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 podman info --format '{{.Host.RemoteSocket.Path}}'
 ```
 
@@ -1498,7 +1518,7 @@ The portability tests start real PostgreSQL containers. This machine has podman
 rather than docker, so point the Docker API client at podman's socket:
 
     systemctl --user enable --now podman.socket
-    export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+    export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
     cargo test --test portability
 
 The tests pull `docker.io/library/postgres:14` and `:18` on first run.
@@ -1634,7 +1654,7 @@ async fn a_role_without_pg_monitor_is_classified_as_limited() {
 - [ ] **Step 4: Run the tests**
 
 ```bash
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 cargo test --test portability 2>&1 | tail -20
 ```
 
@@ -1764,7 +1784,8 @@ impl CollectorHandle {
 
 /// 1s, 2s, 4s, 8s, 16s, then 30s for ever.
 pub fn backoff_delay(consecutive_failures: u32) -> Duration {
-    let seconds = 1u64.saturating_shl(consecutive_failures.min(16));
+    // saturating_shl is not a stable integer method; min() already bounds the shift.
+    let seconds = 1u64 << consecutive_failures.min(16);
     Duration::from_secs(seconds.min(30))
 }
 
@@ -2116,139 +2137,41 @@ git commit -m "feat: vendor GraphWidget from Mission Center (commit 050213c)"
 
 ---
 
-## Task 9: Ring buffer and sidebar row
+## Task 9: Sidebar row with a live sparkline
 
 **Files:**
-- Create: `src/widgets/ring_buffer.rs`, `src/widgets/sidebar_row.rs`, `resources/ui/sidebar_row.blp`
+- Create: `src/widgets/sidebar_row.rs`, `resources/ui/sidebar_row.blp`
 - Modify: `src/widgets/mod.rs`, `resources/meson.build`, `resources/mission-centre-pg.gresource.xml`
 
 **Interfaces:**
-- Consumes: `GraphWidget` (Task 8)
+- Consumes: `GraphWidget` and `DatasetGroup` (Task 8)
 - Produces:
-  - `RingBuffer { capacity: usize }` with `push(f64)`, `values() -> Vec<f64>`, `len()`, `is_empty()`, `resize(usize)`
-  - `SidebarRow` widget with properties `heading: String`, `subheading: String`, `state: ConnectionState`, and `push_value(f64)`
   - `enum ConnectionState { Disconnected, Connecting, Connected, Failed }`
+  - `McpgSidebarRow` widget with `set_heading(&str)`, `set_subheading(&str)`,
+    `set_state(ConnectionState)`, `push_value(f64)`, `reset_series()`
 
-- [ ] **Step 1: Write the failing tests for the ring buffer**
+### How `GraphWidget` actually works
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retains_only_the_most_recent_values() {
-        let mut buffer = RingBuffer::new(3);
-        for value in [1.0, 2.0, 3.0, 4.0] {
-            buffer.push(value);
-        }
-        assert_eq!(buffer.values(), vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn reports_oldest_first() {
-        let mut buffer = RingBuffer::new(4);
-        buffer.push(10.0);
-        buffer.push(20.0);
-        assert_eq!(buffer.values(), vec![10.0, 20.0]);
-        assert_eq!(buffer.len(), 2);
-    }
-
-    #[test]
-    fn starts_empty() {
-        let buffer = RingBuffer::new(5);
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.values(), Vec::<f64>::new());
-    }
-
-    #[test]
-    fn shrinking_drops_the_oldest_values() {
-        let mut buffer = RingBuffer::new(5);
-        for value in [1.0, 2.0, 3.0, 4.0, 5.0] {
-            buffer.push(value);
-        }
-        buffer.resize(2);
-        assert_eq!(buffer.values(), vec![4.0, 5.0]);
-    }
-
-    #[test]
-    fn growing_keeps_existing_values() {
-        let mut buffer = RingBuffer::new(2);
-        buffer.push(1.0);
-        buffer.push(2.0);
-        buffer.resize(4);
-        buffer.push(3.0);
-        assert_eq!(buffer.values(), vec![1.0, 2.0, 3.0]);
-    }
-}
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-```bash
-cargo test --lib ring_buffer 2>&1 | head -20
-```
-
-Expected: FAIL — `cannot find type RingBuffer`.
-
-- [ ] **Step 3: Write `src/widgets/ring_buffer.rs`**
+Task 8 established its real API, which is **not** what earlier drafts of this plan assumed.
+There is no "load a whole series" setter. It is a streaming widget that owns its own bounded
+ring buffer per dataset:
 
 ```rust
-use std::collections::VecDeque;
-
-/// A bounded series of graph points, oldest first. Owned by the UI so that a
-/// reconnect does not wipe the history.
-#[derive(Debug, Clone)]
-pub struct RingBuffer {
-    values: VecDeque<f64>,
-    capacity: usize,
-}
-
-impl RingBuffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            values: VecDeque::with_capacity(capacity),
-            capacity: capacity.max(1),
-        }
-    }
-
-    pub fn push(&mut self, value: f64) {
-        while self.values.len() >= self.capacity {
-            self.values.pop_front();
-        }
-        self.values.push_back(value);
-    }
-
-    pub fn values(&self) -> Vec<f64> {
-        self.values.iter().copied().collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    pub fn resize(&mut self, capacity: usize) {
-        self.capacity = capacity.max(1);
-        while self.values.len() > self.capacity {
-            self.values.pop_front();
-        }
-    }
-}
+let graph = GraphWidget::new(None);            // or Some(&settings)
+graph.set_data_points(60);                     // ring-buffer CAPACITY, a u32 property
+graph.add_dataset(DatasetGroup::new());        // register one series, once
+graph.add_data_point(vec![vec![value as f32]]); // push one row per tick
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+`set_data_points` sets the **capacity**, not the values — the name is misleading, so read it
+carefully. `add_data_point` takes one inner `Vec<f32>` per registered `DatasetGroup`, in the
+order they were added. Values are `f32`.
 
-```bash
-cargo test --lib 2>&1 | tail -10
-```
+Because the widget owns the buffer, this project keeps **no parallel ring buffer of its own**.
+The widget outlives any single connection, so a reconnect does not wipe the history — which is
+what the spec asks for.
 
-Expected: `test result: ok. 24 passed`.
-
-- [ ] **Step 5: Write `resources/ui/sidebar_row.blp`**
+- [ ] **Step 1: Write `resources/ui/sidebar_row.blp`**
 
 ```blueprint
 using Gtk 4.0;
@@ -2288,19 +2211,23 @@ template $McpgSidebarRow: Gtk.Box {
 }
 ```
 
-- [ ] **Step 6: Write `src/widgets/sidebar_row.rs`**
+If blueprint-compiler rejects the `$GraphWidget` custom-type syntax, drop the graph from the
+template, put a `Gtk.Box graph_holder {}` in its place, and append a `GraphWidget` to it from
+Rust in `constructed()`. Say which route you took.
+
+- [ ] **Step 2: Write `src/widgets/sidebar_row.rs`**
 
 ```rust
-use std::cell::RefCell;
-
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crate::widgets::graph_widget::GraphWidget;
-use crate::widgets::ring_buffer::RingBuffer;
+use crate::widgets::graph_widget_utils::DatasetGroup;
 
-const SPARKLINE_POINTS: usize = 60;
+/// Points retained in a sidebar sparkline. Deliberately shorter than the
+/// full pages' graphs — the row is 72px wide.
+const SPARKLINE_POINTS: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
@@ -2325,7 +2252,7 @@ impl ConnectionState {
 mod imp {
     use super::*;
 
-    #[derive(gtk::CompositeTemplate)]
+    #[derive(Default, gtk::CompositeTemplate)]
     #[template(resource = "/io/github/paulsnow/MissionCentrePg/ui/sidebar_row.ui")]
     pub struct McpgSidebarRow {
         #[template_child]
@@ -2336,20 +2263,6 @@ mod imp {
         pub subheading_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub graph: TemplateChild<GraphWidget>,
-
-        pub series: RefCell<RingBuffer>,
-    }
-
-    impl Default for McpgSidebarRow {
-        fn default() -> Self {
-            Self {
-                state_icon: Default::default(),
-                heading_label: Default::default(),
-                subheading_label: Default::default(),
-                graph: Default::default(),
-                series: RefCell::new(RingBuffer::new(SPARKLINE_POINTS)),
-            }
-        }
     }
 
     #[glib::object_subclass]
@@ -2368,7 +2281,14 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for McpgSidebarRow {}
+    impl ObjectImpl for McpgSidebarRow {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.graph.set_data_points(SPARKLINE_POINTS);
+            self.graph.add_dataset(DatasetGroup::new());
+        }
+    }
+
     impl WidgetImpl for McpgSidebarRow {}
     impl BoxImpl for McpgSidebarRow {}
 }
@@ -2398,24 +2318,17 @@ impl McpgSidebarRow {
         self.imp().state_icon.set_icon_name(Some(state.icon_name()));
     }
 
-    pub fn graph(&self) -> GraphWidget {
-        self.imp().graph.get()
-    }
-
-    /// Append one point to the row's sparkline and redraw it.
+    /// Append one point to the sparkline.
     pub fn push_value(&self, value: f64) {
-        let imp = self.imp();
-        imp.series.borrow_mut().push(value);
-        imp.graph
-            .set_data_points(&imp.series.borrow().values(), 0.0);
+        self.imp().graph.add_data_point(vec![vec![value as f32]]);
     }
 
-    /// Drop the series so a reconnect to a different server does not inherit
-    /// the previous one's shape.
-    pub fn clear_series(&self) {
-        let imp = self.imp();
-        imp.series.replace(RingBuffer::new(SPARKLINE_POINTS));
-        imp.graph.set_data_points(&[], 0.0);
+    /// Drop the series so selecting a different server does not inherit the
+    /// previous one's shape.
+    pub fn reset_series(&self) {
+        let graph = self.imp().graph.get();
+        graph.clear_datasets();
+        graph.add_dataset(DatasetGroup::new());
     }
 }
 
@@ -2426,17 +2339,18 @@ impl Default for McpgSidebarRow {
 }
 ```
 
-Add to `src/widgets/mod.rs`:
+- [ ] **Step 3: Update `src/widgets/mod.rs`**
 
 ```rust
-pub mod ring_buffer;
+pub mod graph_widget;
+pub mod graph_widget_utils;
 pub mod sidebar_row;
 
-pub use ring_buffer::RingBuffer;
+pub use graph_widget::GraphWidget;
 pub use sidebar_row::{ConnectionState, McpgSidebarRow};
 ```
 
-- [ ] **Step 7: Register the new Blueprint**
+- [ ] **Step 4: Register the new Blueprint**
 
 In `resources/meson.build`, change the `input:` line to:
 
@@ -2450,20 +2364,22 @@ In `resources/mission-centre-pg.gresource.xml`, add inside `<gresource>`:
     <file preprocess="xml-stripblanks">ui/sidebar_row.ui</file>
 ```
 
-- [ ] **Step 8: Build**
+- [ ] **Step 5: Build**
 
 ```bash
 ninja -C build 2>&1 | tail -20
+cargo test --lib 2>&1 | tail -5
 ```
 
-Expected: build succeeds.
+Expected: build succeeds; the existing 23 tests still pass. There are no new unit tests —
+this is a widget with no logic to assert beyond what the compiler checks.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt
 git add -A
-git commit -m "feat: ring buffer and sparkline sidebar row"
+git commit -m "feat: sidebar row with a live sparkline"
 ```
 
 ---
@@ -2865,7 +2781,7 @@ git commit -m "feat: Add Server dialog storing credentials in the secret store"
 - Modify: `src/lib.rs`, `resources/meson.build`, `resources/mission-centre-pg.gresource.xml`
 
 **Interfaces:**
-- Consumes: `Snapshot`, `DatabaseRates`, `SessionCounts`, `Session` (Task 2); `GraphWidget`, `RingBuffer` (Tasks 8–9)
+- Consumes: `Snapshot`, `DatabaseRates`, `SessionCounts`, `Session` (Task 2); `GraphWidget` and `DatasetGroup` (Task 8)
 - Produces:
   - `OverviewPage` with `pub fn update(&self, snapshot: &Snapshot)` and `pub fn set_graph_points(&self, points: usize)`
   - `SessionsPage` with `pub fn update(&self, sessions: &[Session])`, `pub fn set_hide_idle(&self, hide: bool)`, and `pub fn set_privilege_limited(&self, limited: bool)`
@@ -3082,9 +2998,10 @@ template $McpgOverviewPage: Gtk.Box {
 
 - [ ] **Step 6: Write `src/pages/overview.rs`**
 
-```rust
-use std::cell::RefCell;
+`GraphWidget` owns its own ring buffer (see Task 9). Register one `DatasetGroup` per graph at
+construction, set the capacity, then push one value per sample. Keep no parallel buffer.
 
+```rust
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
@@ -3093,14 +3010,14 @@ use crate::collector::snapshot::Snapshot;
 use crate::i18n::i18n_f;
 use crate::pages::format::{format_bytes, format_ratio, format_rate};
 use crate::widgets::graph_widget::GraphWidget;
-use crate::widgets::RingBuffer;
+use crate::widgets::graph_widget_utils::DatasetGroup;
 
-const DEFAULT_POINTS: usize = 300;
+const DEFAULT_POINTS: u32 = 300;
 
 mod imp {
     use super::*;
 
-    #[derive(gtk::CompositeTemplate)]
+    #[derive(Default, gtk::CompositeTemplate)]
     #[template(resource = "/io/github/paulsnow/MissionCentrePg/ui/overview_page.ui")]
     pub struct McpgOverviewPage {
         #[template_child]
@@ -3125,33 +3042,6 @@ mod imp {
         pub deadlocks_value: TemplateChild<gtk::Label>,
         #[template_child]
         pub temp_value: TemplateChild<gtk::Label>,
-
-        pub connections: RefCell<RingBuffer>,
-        pub tps: RefCell<RingBuffer>,
-        pub cache: RefCell<RingBuffer>,
-        pub tuples: RefCell<RingBuffer>,
-    }
-
-    impl Default for McpgOverviewPage {
-        fn default() -> Self {
-            Self {
-                connections_value: Default::default(),
-                connections_graph: Default::default(),
-                tps_value: Default::default(),
-                tps_graph: Default::default(),
-                cache_value: Default::default(),
-                cache_graph: Default::default(),
-                tuples_value: Default::default(),
-                tuples_graph: Default::default(),
-                database_size_value: Default::default(),
-                deadlocks_value: Default::default(),
-                temp_value: Default::default(),
-                connections: RefCell::new(RingBuffer::new(DEFAULT_POINTS)),
-                tps: RefCell::new(RingBuffer::new(DEFAULT_POINTS)),
-                cache: RefCell::new(RingBuffer::new(DEFAULT_POINTS)),
-                tuples: RefCell::new(RingBuffer::new(DEFAULT_POINTS)),
-            }
-        }
     }
 
     #[glib::object_subclass]
@@ -3170,7 +3060,19 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for McpgOverviewPage {}
+    impl ObjectImpl for McpgOverviewPage {
+        fn constructed(&self) {
+            self.parent_constructed();
+            for graph in self.obj().graphs() {
+                graph.set_data_points(DEFAULT_POINTS);
+                graph.add_dataset(DatasetGroup::new());
+            }
+            // A ratio is always 0-100, so pin the scale rather than letting it
+            // auto-fit and make a flat 99% line look dramatic.
+            self.cache_graph.set_dataset_max_scale(0, 100.0);
+        }
+    }
+
     impl WidgetImpl for McpgOverviewPage {}
     impl BoxImpl for McpgOverviewPage {}
 }
@@ -3186,12 +3088,20 @@ impl McpgOverviewPage {
         glib::Object::new()
     }
 
-    pub fn set_graph_points(&self, points: usize) {
+    fn graphs(&self) -> [GraphWidget; 4] {
         let imp = self.imp();
-        imp.connections.borrow_mut().resize(points);
-        imp.tps.borrow_mut().resize(points);
-        imp.cache.borrow_mut().resize(points);
-        imp.tuples.borrow_mut().resize(points);
+        [
+            imp.connections_graph.get(),
+            imp.tps_graph.get(),
+            imp.cache_graph.get(),
+            imp.tuples_graph.get(),
+        ]
+    }
+
+    pub fn set_graph_points(&self, points: u32) {
+        for graph in self.graphs() {
+            graph.set_data_points(points);
+        }
     }
 
     pub fn update(&self, snapshot: &Snapshot) {
@@ -3201,14 +3111,12 @@ impl McpgOverviewPage {
         let max_connections = snapshot.settings.max_connections;
         imp.connections_value.set_text(&i18n_f(
             "{} / {}",
-            &[
-                &format_rate(connections),
-                &max_connections.to_string(),
-            ],
+            &[&format_rate(connections), &max_connections.to_string()],
         ));
-        imp.connections.borrow_mut().push(connections);
         imp.connections_graph
-            .set_data_points(&imp.connections.borrow().values(), max_connections as f64);
+            .set_dataset_max_scale(0, max_connections as f32);
+        imp.connections_graph
+            .add_data_point(vec![vec![connections as f32]]);
 
         imp.database_size_value.set_text(
             &snapshot
@@ -3218,35 +3126,35 @@ impl McpgOverviewPage {
         );
 
         // The first sample after connecting has no previous reading, so there
-        // are no rates yet. Leave the rate graphs untouched rather than
-        // pushing a fabricated zero.
+        // are no rates yet. Push nothing rather than a fabricated zero.
         let Some(rates) = snapshot.rates else {
-            imp.tps_value.set_text("—");
-            imp.cache_value.set_text("—");
-            imp.tuples_value.set_text("—");
-            imp.deadlocks_value.set_text("—");
-            imp.temp_value.set_text("—");
+            for label in [
+                &imp.tps_value,
+                &imp.cache_value,
+                &imp.tuples_value,
+                &imp.deadlocks_value,
+                &imp.temp_value,
+            ] {
+                label.set_text("—");
+            }
             return;
         };
 
         imp.tps_value
             .set_text(&format_rate(rates.transactions_per_sec));
-        imp.tps.borrow_mut().push(rates.transactions_per_sec);
         imp.tps_graph
-            .set_data_points(&imp.tps.borrow().values(), 0.0);
+            .add_data_point(vec![vec![rates.transactions_per_sec as f32]]);
 
         imp.cache_value.set_text(&format_ratio(rates.cache_hit_ratio));
         if let Some(ratio) = rates.cache_hit_ratio {
-            imp.cache.borrow_mut().push(ratio * 100.0);
             imp.cache_graph
-                .set_data_points(&imp.cache.borrow().values(), 100.0);
+                .add_data_point(vec![vec![(ratio * 100.0) as f32]]);
         }
 
         imp.tuples_value
             .set_text(&format_rate(rates.tuples_returned_per_sec));
-        imp.tuples.borrow_mut().push(rates.tuples_returned_per_sec);
         imp.tuples_graph
-            .set_data_points(&imp.tuples.borrow().values(), 0.0);
+            .add_data_point(vec![vec![rates.tuples_returned_per_sec as f32]]);
 
         imp.deadlocks_value
             .set_text(&format_rate(rates.deadlocks_per_sec));
@@ -3262,7 +3170,9 @@ impl Default for McpgOverviewPage {
 }
 ```
 
-`set_data_points` is the adapter onto the vendored `GraphWidget`. Its exact upstream API is whatever `src/widgets/graph_widget.rs` exposes — read that file and use its real method names. If upstream's setter differs (for example `add_data_point` per value, or a `set_value_range`), write a small `fn apply(graph: &GraphWidget, values: &[f64], max: f64)` helper in `src/pages/mod.rs` and call it from all four sites rather than repeating the adaptation.
+Task 9 established that blueprint-compiler accepts `$GraphWidget` directly in a template — the
+generated `.ui` carries `<object class="GraphWidget" id="...">` — provided `GraphWidget::ensure_type()`
+runs in `class_init`. Use that route; no `Gtk.Box` fallback is needed.
 
 - [ ] **Step 7: Write `resources/ui/sessions_page.blp`**
 
@@ -3722,7 +3632,6 @@ use gtk::{gio, glib};
 
 use mission_centre_pg::collector::worker::{spawn, CollectorEvent, CollectorHandle};
 use mission_centre_pg::connection::params::ConnectionParams;
-use mission_centre_pg::connection::probe::MIN_SUPPORTED_VERSION;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{McpgOverviewPage, McpgSessionsPage};
@@ -3779,7 +3688,7 @@ mod imp {
 
             let settings = gio::Settings::new(APP_ID);
             self.overview_page
-                .set_graph_points(settings.int("graph-points").max(1) as usize);
+                .set_graph_points(settings.int("graph-points").max(1) as u32);
             self.sessions_page
                 .set_hide_idle(settings.boolean("hide-idle-sessions"));
             self.settings.replace(Some(settings));
@@ -3808,7 +3717,8 @@ mod imp {
 glib::wrapper! {
     pub struct MissionCentrePgWindow(ObjectSubclass<imp::MissionCentrePgWindow>)
         @extends adw::ApplicationWindow, gtk::ApplicationWindow, gtk::Window, gtk::Widget,
-        @implements gio::ActionGroup, gio::ActionMap;
+        @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
+                    gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
 impl MissionCentrePgWindow {
@@ -3848,7 +3758,9 @@ impl MissionCentrePgWindow {
         dialog.connect_added(move |params| {
             let mut servers = registry::load(&window.settings());
             servers.push(params.clone());
-            let _ = registry::save(&window.settings(), &servers);
+            if let Err(e) = registry::save(&window.settings(), &servers) {
+                gtk::glib::g_warning!("mission-centre-pg", "could not save the server list: {e}");
+            }
             window.reload_servers();
         });
         dialog.present(Some(self));
@@ -3917,7 +3829,7 @@ impl MissionCentrePgWindow {
                 ));
                 imp.sessions_page.set_privilege_limited(limited);
 
-                if info.version_num < MIN_SUPPORTED_VERSION {
+                if info.is_below_floor() {
                     imp.error_banner.set_revealed(true);
                     imp.error_banner.set_title(&i18n_f(
                         "PostgreSQL {} is older than the supported floor of 14. Some statistics may be missing.",
@@ -3996,7 +3908,7 @@ secret-tool search service mission-centre-pg 2>&1 | head -5
 ```bash
 cargo fmt --check
 cargo test --lib
-export DOCKER_HOST="unix:///run/user/$(id -u)/podman.sock"
+export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"
 cargo test --test portability
 git add -A
 git commit -m "feat: wire the window to the collector, completing Phase 1"

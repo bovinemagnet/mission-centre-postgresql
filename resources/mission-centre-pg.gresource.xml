@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/paulsnow/MissionCentrePg">
+    <file preprocess="xml-stripblanks">ui/window.ui</file>
+    <file preprocess="xml-stripblanks">ui/sidebar_row.ui</file>
+    <file preprocess="xml-stripblanks">ui/add_server_dialog.ui</file>
+    <file preprocess="xml-stripblanks">ui/overview_page.ui</file>
+    <file preprocess="xml-stripblanks">ui/sessions_page.ui</file>
+  </gresource>
+</gresources>
