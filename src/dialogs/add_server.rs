@@ -52,6 +52,8 @@ mod imp {
         #[template_child]
         pub ssl_row: TemplateChild<adw::ComboRow>,
         #[template_child]
+        pub history_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
         pub add_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub cancel_button: TemplateChild<gtk::Button>,
@@ -155,7 +157,11 @@ impl McpgAddServerDialog {
                 2 => SslMode::Require,
                 _ => SslMode::Prefer,
             },
-            history: HistoryMode::Off,
+            history: match imp.history_row.selected() {
+                1 => HistoryMode::Local,
+                2 => HistoryMode::PgConsole,
+                _ => HistoryMode::Off,
+            },
         };
 
         // The password goes straight to the secret store and is never held on

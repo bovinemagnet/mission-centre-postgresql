@@ -29,7 +29,7 @@ use gtk::{gio, glib};
 use mission_centre_pg::collector::worker::{
     spawn, CollectorConfig, CollectorEvent, CollectorHandle,
 };
-use mission_centre_pg::connection::params::ConnectionParams;
+use mission_centre_pg::connection::params::{ConnectionParams, HistoryMode};
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
@@ -201,6 +201,12 @@ impl MissionCentrePgWindow {
             let row = McpgSidebarRow::new(&server.label);
             row.set_subheading(&format!("{}:{}", server.host, server.port));
             row.set_state(ConnectionState::Disconnected);
+            row.set_history_mode(server.history);
+            let window = self.clone();
+            let server_id = server.id;
+            row.connect_history_change(move |mode| {
+                window.set_server_history(server_id, mode);
+            });
             imp.server_list.append(&row);
             if Some(server.id) == selected_id {
                 restore_index = Some(i as i32);
@@ -218,6 +224,30 @@ impl MissionCentrePgWindow {
                 imp.restoring_selection.set(true);
                 imp.server_list.select_row(Some(&row));
                 imp.restoring_selection.set(false);
+            }
+        }
+    }
+
+    /// Persist a new history mode for the server with `id` and, if that server
+    /// is the one currently on screen, restart its collector so the new backend
+    /// takes effect immediately.
+    fn set_server_history(&self, id: uuid::Uuid, mode: HistoryMode) {
+        let mut servers = registry::load(&self.settings());
+        let Some(server) = servers.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        server.history = mode;
+        if let Err(e) = registry::save(&self.settings(), &servers) {
+            gtk::glib::g_warning!("mission-centre-pg", "could not save the server list: {e}");
+            return;
+        }
+        self.imp().servers.replace(servers);
+
+        // If this server is the one on screen, restart its collector so the
+        // new backend takes effect immediately.
+        if let Some(index) = self.imp().servers.borrow().iter().position(|s| s.id == id) {
+            if self.imp().server_list.selected_row().map(|r| r.index()) == Some(index as i32) {
+                self.select_server(index as i32);
             }
         }
     }

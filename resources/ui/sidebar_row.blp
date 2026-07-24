@@ -32,4 +32,11 @@ template $McpgSidebarRow: Gtk.Box {
     height-request: 28;
     valign: center;
   }
+
+  Gtk.MenuButton history_menu_button {
+    icon-name: "view-more-symbolic";
+    valign: center;
+    has-frame: false;
+    tooltip-text: _("History storage");
+  }
 }
