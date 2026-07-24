@@ -27,7 +27,9 @@ use mission_centre_pg::collector::queries::{
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
 };
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
-use mission_centre_pg::connection::probe::{map_server_info, PrivilegeLevel, PROBE_SQL};
+use mission_centre_pg::connection::probe::{
+    map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
+};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -184,5 +186,22 @@ async fn a_role_without_pg_monitor_is_classified_as_limited() {
         info.privilege,
         PrivilegeLevel::Limited,
         "watcher should be classified as limited when probing over its own connection"
+    );
+}
+
+#[tokio::test]
+async fn a_server_without_the_extension_probes_as_not_installed() {
+    // The gate must not depend on issuing the query and interpreting the
+    // failure: a stock container has no pg_stat_statements at all.
+    let (client, _container) = connect("18").await;
+
+    let probe = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed");
+
+    assert_eq!(
+        map_server_info(&probe).statements,
+        StatementsAvailability::NotInstalled
     );
 }
