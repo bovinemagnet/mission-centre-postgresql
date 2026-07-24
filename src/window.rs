@@ -31,7 +31,9 @@ use mission_centre_pg::collector::worker::{
 use mission_centre_pg::connection::params::ConnectionParams;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
-use mission_centre_pg::pages::{McpgOverviewPage, McpgQueriesPage, McpgSessionsPage};
+use mission_centre_pg::pages::{
+    McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
+};
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
 use mission_centre_pg::i18n::{i18n, i18n_f};
@@ -58,6 +60,8 @@ mod imp {
         pub sessions_page: TemplateChild<McpgSessionsPage>,
         #[template_child]
         pub queries_page: TemplateChild<McpgQueriesPage>,
+        #[template_child]
+        pub relations_page: TemplateChild<McpgRelationsPage>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -91,6 +95,7 @@ mod imp {
             McpgOverviewPage::ensure_type();
             McpgSessionsPage::ensure_type();
             McpgQueriesPage::ensure_type();
+            McpgRelationsPage::ensure_type();
             klass.bind_template();
         }
 
@@ -344,6 +349,8 @@ impl MissionCentrePgWindow {
                     &info.statements,
                     &imp.connected_database.borrow(),
                 );
+                imp.relations_page
+                    .set_database(&imp.connected_database.borrow());
 
                 if info.is_below_floor() {
                     let message = i18n_f(
@@ -375,6 +382,11 @@ impl MissionCentrePgWindow {
                 match snapshot.statements.as_ref() {
                     Some(Ok(sample)) => imp.queries_page.update(sample),
                     Some(Err(error)) => imp.queries_page.set_error(&i18n(&error.to_string())),
+                    None => {}
+                }
+                match snapshot.relations.as_ref() {
+                    Some(Ok(sample)) => imp.relations_page.update(sample),
+                    Some(Err(error)) => imp.relations_page.set_error(&i18n(&error.to_string())),
                     None => {}
                 }
                 if let Some(row) = self.selected_row() {

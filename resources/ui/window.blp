@@ -72,6 +72,13 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
             icon-name: "format-justify-left-symbolic";
             child: $McpgQueriesPage queries_page {};
           }
+
+          Adw.ViewStackPage {
+            name: "relations";
+            title: _("Tables & Indexes");
+            icon-name: "drive-harddisk-symbolic";
+            child: $McpgRelationsPage relations_page {};
+          }
         };
       };
     };
