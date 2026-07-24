@@ -259,6 +259,10 @@ impl MissionCentrePgWindow {
         // interval, during which the old server's statistics would sit
         // under the new connection with nothing to mark them stale.
         imp.queries_page.clear();
+        // Clear the relations page for the same reason: its rows also belong
+        // to the server just left, and are also refreshed only on the slow
+        // tier.
+        imp.relations_page.clear();
 
         let password = match credentials::fetch_password(&params.id) {
             Ok(password) => password.unwrap_or_default(),

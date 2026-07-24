@@ -346,6 +346,23 @@ impl McpgRelationsPage {
         ));
     }
 
+    /// Drops the tables and indexes from the previously selected server.
+    /// Called on a server switch, not on a reconnect: until the new server's
+    /// first slow sample arrives, the old server's rows would otherwise be
+    /// presented under the new connection with nothing to mark them stale —
+    /// indefinitely, if that connection never succeeds.
+    pub fn clear(&self) {
+        let imp = self.imp();
+        if let Some(table) = imp.tables.borrow().as_ref() {
+            table.update(&[]);
+        }
+        if let Some(table) = imp.indexes.borrow().as_ref() {
+            table.update(&[]);
+        }
+        imp.database_note.set_text("");
+        imp.error_banner.set_revealed(false);
+    }
+
     pub fn update(&self, sample: &RelationsSample) {
         let imp = self.imp();
         imp.error_banner.set_revealed(false);
