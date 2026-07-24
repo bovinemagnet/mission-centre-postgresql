@@ -26,6 +26,22 @@
       <default>2000</default>
       <summary>Minimum gap between samples in milliseconds</summary>
     </key>
+    <key name="slow-sample-interval-ms" type="i">
+      <range min="2000" max="300000"/>
+      <default>10000</default>
+      <summary>Minimum gap between slow-tier samples in milliseconds</summary>
+      <description>Controls how often the Queries and Tables and Indexes pages are refreshed. These statistics are far more expensive to collect than the Overview and Sessions data, so they are sampled less often.</description>
+    </key>
+    <key name="statements-limit" type="i">
+      <range min="10" max="1000"/>
+      <default>200</default>
+      <summary>Rows fetched from pg_stat_statements per slow sample</summary>
+    </key>
+    <key name="relations-limit" type="i">
+      <range min="10" max="1000"/>
+      <default>200</default>
+      <summary>Rows fetched from each relation statistics view per slow sample</summary>
+    </key>
     <key name="graph-points" type="i">
       <range min="10" max="600"/>
       <default>300</default>

@@ -20,6 +20,10 @@
 
 use std::time::Instant;
 
+use super::relations::RelationsSample;
+use super::statements::StatementsSample;
+use super::worker::CollectorError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseCounters {
     pub xact_commit: i64,
@@ -135,4 +139,8 @@ pub struct Snapshot {
     pub session_counts: SessionCounts,
     pub sessions: Vec<Session>,
     pub settings: ServerSettings,
+    /// `None` on a fast tick — the page keeps its previous contents.
+    /// `Err` carries the reason the page renders in place of its table.
+    pub statements: Option<Result<StatementsSample, CollectorError>>,
+    pub relations: Option<Result<RelationsSample, CollectorError>>,
 }

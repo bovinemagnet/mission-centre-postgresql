@@ -25,7 +25,9 @@ use adw::subclass::prelude::*;
 use gtk::prelude::{Cast, IsA};
 use gtk::{gio, glib};
 
-use mission_centre_pg::collector::worker::{spawn, CollectorEvent, CollectorHandle};
+use mission_centre_pg::collector::worker::{
+    spawn, CollectorConfig, CollectorEvent, CollectorHandle,
+};
 use mission_centre_pg::connection::params::ConnectionParams;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
@@ -254,9 +256,17 @@ impl MissionCentrePgWindow {
             }
         };
 
-        let interval = std::time::Duration::from_millis(
-            self.settings().int("sample-interval-ms").max(500) as u64,
-        );
+        let settings = self.settings();
+        let config = CollectorConfig {
+            interval: std::time::Duration::from_millis(
+                settings.int("sample-interval-ms").max(500) as u64
+            ),
+            slow_interval: std::time::Duration::from_millis(
+                settings.int("slow-sample-interval-ms").max(2000) as u64,
+            ),
+            statements_limit: settings.int("statements-limit").max(10) as i64,
+            relations_limit: settings.int("relations-limit").max(10) as i64,
+        };
 
         // Every event this collector ever emits is stamped with this
         // generation; the event loop below discards anything that arrives
@@ -264,7 +274,7 @@ impl MissionCentrePgWindow {
         let generation = imp.generation.get().saturating_add(1);
         imp.generation.set(generation);
 
-        let handle = spawn(params, password, interval);
+        let handle = spawn(params, password, config);
         let events = handle.events.clone();
         imp.collector.replace(Some(handle));
 
