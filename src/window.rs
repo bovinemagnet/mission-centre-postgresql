@@ -249,6 +249,12 @@ impl MissionCentrePgWindow {
             row.reset_series();
         }
 
+        // Clear the queries page too: its rows belong to the server just
+        // left, and the slow tier will not refresh them for up to one slow
+        // interval, during which the old server's statistics would sit
+        // under the new connection with nothing to mark them stale.
+        imp.queries_page.clear();
+
         let password = match credentials::fetch_password(&params.id) {
             Ok(password) => password.unwrap_or_default(),
             Err(e) => {

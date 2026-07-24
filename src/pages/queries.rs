@@ -24,7 +24,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 
-use crate::collector::statements::{Statement, StatementsSample};
+use crate::collector::statements::{Statement, StatementCounters, StatementsSample};
 use crate::connection::probe::StatementsAvailability;
 use crate::i18n::{i18n, i18n_f};
 use crate::pages::format::{format_rate, format_ratio};
@@ -66,18 +66,33 @@ fn render_total_time(row: &QueryRow) -> String {
     }
 }
 
+/// `None` when the statement has never been called — no mean exists, and
+/// reporting zero would claim one was measured.
+fn cumulative_mean_ms(counters: &StatementCounters) -> Option<f64> {
+    if counters.calls > 0 {
+        Some(counters.total_exec_time_ms / counters.calls as f64)
+    } else {
+        None
+    }
+}
+
+/// `None` when no shared blocks have been touched.
+fn cumulative_cache_hit(counters: &StatementCounters) -> Option<f64> {
+    let total = counters.shared_blks_hit + counters.shared_blks_read;
+    if total > 0 {
+        Some(counters.shared_blks_hit as f64 / total as f64)
+    } else {
+        None
+    }
+}
+
 fn render_mean_time(row: &QueryRow) -> String {
     let mean = if row.delta_mode {
         row.statement
             .delta
             .and_then(|delta| delta.mean_exec_time_ms)
     } else {
-        let counters = &row.statement.cumulative;
-        if counters.calls > 0 {
-            Some(counters.total_exec_time_ms / counters.calls as f64)
-        } else {
-            None
-        }
+        cumulative_mean_ms(&row.statement.cumulative)
     };
     match mean {
         Some(value) if value.is_finite() => format!("{value:.1} ms"),
@@ -100,13 +115,7 @@ fn render_cache_hit(row: &QueryRow) -> String {
             None => "—".to_string(),
         };
     }
-    let counters = &row.statement.cumulative;
-    let total = counters.shared_blks_hit + counters.shared_blks_read;
-    format_ratio(if total > 0 {
-        Some(counters.shared_blks_hit as f64 / total as f64)
-    } else {
-        None
-    })
+    format_ratio(cumulative_cache_hit(&row.statement.cumulative))
 }
 
 /// Sort keys mirror the renderers: sorting by a cumulative figure while the
@@ -136,12 +145,7 @@ fn mean_time_key(row: &QueryRow) -> f64 {
             .and_then(|delta| delta.mean_exec_time_ms)
             .unwrap_or(0.0);
     }
-    let counters = &row.statement.cumulative;
-    if counters.calls > 0 {
-        counters.total_exec_time_ms / counters.calls as f64
-    } else {
-        0.0
-    }
+    cumulative_mean_ms(&row.statement.cumulative).unwrap_or(0.0)
 }
 
 fn rows_key(row: &QueryRow) -> f64 {
@@ -160,13 +164,7 @@ fn cache_hit_key(row: &QueryRow) -> f64 {
             .and_then(|delta| delta.cache_hit_ratio)
             .unwrap_or(0.0);
     }
-    let counters = &row.statement.cumulative;
-    let total = counters.shared_blks_hit + counters.shared_blks_read;
-    if total > 0 {
-        counters.shared_blks_hit as f64 / total as f64
-    } else {
-        0.0
-    }
+    cumulative_cache_hit(&row.statement.cumulative).unwrap_or(0.0)
 }
 
 const COLUMNS: &[Column<QueryRow>] = &[
@@ -382,6 +380,15 @@ impl McpgQueriesPage {
         self.imp().privilege_note.set_revealed(limited);
     }
 
+    /// Drops the statements from the previously selected server. Called on a
+    /// server switch, not on a reconnect: until the new server's first slow
+    /// sample arrives, the old server's rows would otherwise be presented
+    /// under the new connection with nothing to mark them stale.
+    pub fn clear(&self) {
+        self.imp().statements.replace(Vec::new());
+        self.rebuild_rows();
+    }
+
     pub fn update(&self, sample: &StatementsSample) {
         self.imp().statements.replace(sample.statements.clone());
         self.imp().stack.set_visible_child_name("table");
@@ -435,7 +442,10 @@ mod tests {
         StatementDelta {
             calls_per_sec: 25.0,
             exec_time_ms_per_sec: 125.0,
-            mean_exec_time_ms: Some(5.0),
+            // Deliberately distinct from the cumulative mean (2,000/400 =
+            // 5.0 ms) so a test that reads the wrong branch fails instead
+            // of coincidentally passing.
+            mean_exec_time_ms: Some(7.5),
             rows_per_sec: 50.0,
             cache_hit_ratio: Some(0.95),
         }
@@ -449,13 +459,20 @@ mod tests {
     #[test]
     fn cumulative_mode_shows_totals_since_the_reset() {
         assert_eq!(render_calls(&row(false, Some(delta()))), "400");
+        // Computed from the counters (2,000 ms / 400 calls), not read from
+        // the delta's stored 7.5.
         assert_eq!(render_mean_time(&row(false, Some(delta()))), "5.0 ms");
+        assert_eq!(render_total_time(&row(false, Some(delta()))), "2,000 ms");
+        assert_eq!(render_rows(&row(false, Some(delta()))), "800");
+        assert_eq!(render_cache_hit(&row(false, Some(delta()))), "90.0%");
     }
 
     #[test]
     fn interval_mode_shows_per_second_figures() {
         assert_eq!(render_calls(&row(true, Some(delta()))), "25/s");
         assert_eq!(render_rows(&row(true, Some(delta()))), "50/s");
+        // Read straight from the delta's stored 7.5, not computed.
+        assert_eq!(render_mean_time(&row(true, Some(delta()))), "7.5 ms");
     }
 
     #[test]
