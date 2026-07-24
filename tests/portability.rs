@@ -22,11 +22,16 @@
 //! supported release. If a column is missing on PostgreSQL 14, this is what
 //! catches it.
 
+use std::time::Duration;
+
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
 };
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
+use mission_centre_pg::collector::statements::{
+    apply_deltas, counters_by_key, map_statement, STATEMENTS_SQL,
+};
 use mission_centre_pg::connection::probe::{
     map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
 };
@@ -80,6 +85,33 @@ async fn connect(
 ) {
     let container = start_container(tag).await;
     let client = connect_as(&container, "postgres", "postgres").await;
+    (client, container)
+}
+
+/// A container with pg_stat_statements preloaded and the extension created.
+/// The library must be in shared_preload_libraries before the server starts;
+/// CREATE EXTENSION alone is not enough.
+async fn connect_with_statements(
+    tag: &str,
+) -> (
+    tokio_postgres::Client,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .with_tag(tag)
+        .with_cmd([
+            "postgres",
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+        ])
+        .start()
+        .await
+        .expect("failed to start the PostgreSQL container");
+    let client = connect_as(&container, "postgres", "postgres").await;
+    client
+        .batch_execute("CREATE EXTENSION pg_stat_statements")
+        .await
+        .expect("failed to create the extension");
     (client, container)
 }
 
@@ -203,5 +235,83 @@ async fn a_server_without_the_extension_probes_as_not_installed() {
     assert_eq!(
         map_server_info(&probe).statements,
         StatementsAvailability::NotInstalled
+    );
+}
+
+async fn assert_statements_sql_runs(tag: &str) {
+    let (client, _container) = connect_with_statements(tag).await;
+
+    let probe = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed");
+    assert!(
+        map_server_info(&probe).statements.is_available(),
+        "the extension should probe as available once created"
+    );
+
+    // Give pg_stat_statements something of our own to record.
+    client
+        .batch_execute("SELECT 1; SELECT 1; SELECT 1")
+        .await
+        .expect("failed to run a sample workload");
+
+    let rows = client
+        .query(STATEMENTS_SQL, &[&200i64])
+        .await
+        .expect("pg_stat_statements query failed");
+    assert!(!rows.is_empty(), "pg_stat_statements returned no rows");
+
+    let statements: Vec<_> = rows.iter().map(map_statement).collect();
+    assert!(
+        statements.iter().all(|s| s.cumulative.calls > 0),
+        "every recorded statement should have been called at least once"
+    );
+    assert!(
+        statements.iter().all(|s| s.delta.is_none()),
+        "a single sample has nothing to derive a delta from"
+    );
+}
+
+#[tokio::test]
+async fn statements_sql_runs_on_postgres_14() {
+    assert_statements_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn statements_sql_runs_on_postgres_18() {
+    assert_statements_sql_runs("18").await;
+}
+
+#[tokio::test]
+async fn a_delta_is_derived_across_two_statement_samples() {
+    let (client, _container) = connect_with_statements("18").await;
+
+    let first: Vec<_> = client
+        .query(STATEMENTS_SQL, &[&200i64])
+        .await
+        .expect("first statements query failed")
+        .iter()
+        .map(map_statement)
+        .collect();
+    let previous = counters_by_key(&first);
+
+    client
+        .batch_execute("SELECT count(*) FROM pg_class")
+        .await
+        .expect("failed to run a workload between samples");
+
+    let mut second: Vec<_> = client
+        .query(STATEMENTS_SQL, &[&200i64])
+        .await
+        .expect("second statements query failed")
+        .iter()
+        .map(map_statement)
+        .collect();
+    apply_deltas(&mut second, &previous, Duration::from_secs(1));
+
+    assert!(
+        second.iter().any(|s| s.delta.is_some()),
+        "at least one statement seen in both samples should carry a delta"
     );
 }
