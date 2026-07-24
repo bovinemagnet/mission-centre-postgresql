@@ -3,3 +3,6 @@
 /build-*/
 !/build-aux/
 *.gresource
+# Produced by glib-compile-schemas when running from the source tree rather
+# than an installed prefix.
+/data/gschemas.compiled
