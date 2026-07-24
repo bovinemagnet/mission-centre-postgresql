@@ -39,6 +39,14 @@ pub struct QueryRow {
     pub delta_mode: bool,
 }
 
+/// Whether the table should actually render in interval mode: the user's
+/// chosen mode, gated on at least one row carrying a delta. Until the first
+/// delta exists there is nothing to show in interval mode, and cumulative
+/// figures are better than a screen of dashes.
+fn effective_delta_mode(requested: bool, statements: &[Statement]) -> bool {
+    requested && statements.iter().any(|statement| statement.delta.is_some())
+}
+
 fn render_query(row: &QueryRow) -> String {
     row.statement
         .query
@@ -326,10 +334,12 @@ impl McpgQueriesPage {
 
     fn rebuild_rows(&self) {
         let imp = self.imp();
-        let delta_mode = imp.delta_mode.get();
-        let rows: Vec<QueryRow> = imp
-            .statements
-            .borrow()
+        let statements = imp.statements.borrow();
+        // Self-heals on the next slow sample without touching the toggle,
+        // which stays "Last interval" throughout: that is still what the
+        // user selected, and what they get as soon as a delta exists.
+        let delta_mode = effective_delta_mode(imp.delta_mode.get(), &statements);
+        let rows: Vec<QueryRow> = statements
             .iter()
             .cloned()
             .map(|statement| QueryRow {
@@ -383,9 +393,17 @@ impl McpgQueriesPage {
     /// Drops the statements from the previously selected server. Called on a
     /// server switch, not on a reconnect: until the new server's first slow
     /// sample arrives, the old server's rows would otherwise be presented
-    /// under the new connection with nothing to mark them stale.
+    /// under the new connection with nothing to mark them stale. Also resets
+    /// the stack and status page: otherwise an unavailability or error
+    /// message about the previous server (e.g. "the extension is not present
+    /// in the database A_db") would go on being shown about the new one,
+    /// including one that never finishes connecting.
     pub fn clear(&self) {
-        self.imp().statements.replace(Vec::new());
+        let imp = self.imp();
+        imp.statements.replace(Vec::new());
+        imp.status_page.set_title("");
+        imp.status_page.set_description(None);
+        imp.stack.set_visible_child_name("table");
         self.rebuild_rows();
     }
 
@@ -397,6 +415,12 @@ impl McpgQueriesPage {
 
     /// The extension is present but its query failed — insufficient
     /// privilege, or the extension dropped mid-session.
+    ///
+    /// This discards the table for the status page rather than banner-over-
+    /// stale-rows, unlike `McpgRelationsPage::set_error`: this page already
+    /// owns a status-page slot for the availability gate, so a failure has
+    /// somewhere to go that the relations page does not have, and reusing it
+    /// keeps one explanation mechanism per page rather than two.
     pub fn set_error(&self, message: &str) {
         let imp = self.imp();
         imp.status_page
@@ -498,5 +522,25 @@ mod tests {
         // With no delta, an interval-mode row sorts to the bottom rather
         // than borrowing its cumulative figure.
         assert_eq!(calls_key(&row(true, None)), 0.0);
+    }
+
+    #[test]
+    fn interval_mode_falls_back_to_cumulative_until_a_delta_exists() {
+        // The first slow sample after connecting: every row's delta is
+        // `None`. Rendering the requested interval mode here would produce a
+        // full screen of dashes with no explanation, for up to a whole slow
+        // interval.
+        let no_deltas_yet = [row(true, None).statement];
+        assert!(!effective_delta_mode(true, &no_deltas_yet));
+
+        // Once any row carries a delta, interval mode renders as requested.
+        let one_delta = [
+            row(true, None).statement,
+            row(true, Some(delta())).statement,
+        ];
+        assert!(effective_delta_mode(true, &one_delta));
+
+        // Cumulative mode is unaffected either way.
+        assert!(!effective_delta_mode(false, &no_deltas_yet));
     }
 }

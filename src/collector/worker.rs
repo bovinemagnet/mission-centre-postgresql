@@ -183,13 +183,6 @@ fn classify_slow<T>(
     }
 }
 
-/// True when this snapshot carries slow-tier results, successful or failed.
-/// A failed slow tier still counts: retrying a broken view every two seconds
-/// would turn one degraded page into a load problem.
-fn slow_tier_ran(snapshot: &Snapshot) -> bool {
-    snapshot.statements.is_some() || snapshot.relations.is_some()
-}
-
 pub fn spawn(
     params: ConnectionParams,
     password: String,
@@ -394,19 +387,21 @@ async fn sample_loop(
             return Exit::Stopped;
         }
 
-        let slow = is_slow_tick(
-            last_slow,
-            Instant::now(),
-            config.slow_interval,
-            is_first_sample,
-        )
-        .then_some(SlowTier {
-            statements_available,
-            statements_limit: config.statements_limit,
-            relations_limit: config.relations_limit,
-            previous_statements: previous_statements
-                .as_ref()
-                .map(|(counters, at)| (counters, *at)),
+        let now = Instant::now();
+        let slow = is_slow_tick(last_slow, now, config.slow_interval, is_first_sample).then(|| {
+            // Record the attempt here, not from the outcome: a slow tick
+            // that times out still needs `last_slow` advanced, or
+            // `is_slow_tick` would fire again on the very next fast tick
+            // and turn one slow query into a permanent reconnect loop.
+            last_slow = Some(now);
+            SlowTier {
+                statements_available,
+                statements_limit: config.statements_limit,
+                relations_limit: config.relations_limit,
+                previous_statements: previous_statements
+                    .as_ref()
+                    .map(|(counters, at)| (counters, *at)),
+            }
         });
 
         match sample(client, previous, slow).await {
@@ -417,9 +412,6 @@ async fn sample_loop(
                 if let Some(Ok(sample)) = snapshot.statements.as_ref() {
                     previous_statements =
                         Some((counters_by_key(&sample.statements), snapshot.taken_at));
-                }
-                if slow_tier_ran(&snapshot) {
-                    last_slow = Some(snapshot.taken_at);
                 }
                 emit_sample(events, Box::new(snapshot));
             }
@@ -570,7 +562,6 @@ fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::snapshot::SessionCounts;
 
     #[test]
     fn backoff_doubles_and_then_caps_at_thirty_seconds() {
@@ -691,74 +682,20 @@ mod tests {
         ));
     }
 
-    /// A `Snapshot` with valid but arbitrary Phase 1 fields, so tests of the
-    /// slow-tier fields don't need to care about the rest of the struct.
-    fn test_snapshot(
-        statements: Option<Result<StatementsSample, CollectorError>>,
-        relations: Option<Result<RelationsSample, CollectorError>>,
-    ) -> Snapshot {
-        Snapshot {
-            taken_at: Instant::now(),
-            totals: DatabaseCounters::default(),
-            rates: None,
-            connected_database_size_bytes: None,
-            session_counts: SessionCounts {
-                active: 0,
-                idle: 0,
-                idle_in_transaction: 0,
-                other: 0,
-            },
-            sessions: Vec::new(),
-            settings: ServerSettings {
-                max_connections: 100,
-            },
-            statements,
-            relations,
-        }
-    }
-
     #[test]
-    fn slow_tier_ran_is_false_when_neither_field_was_sampled() {
-        assert!(!slow_tier_ran(&test_snapshot(None, None)));
-    }
-
-    #[test]
-    fn slow_tier_ran_is_true_when_both_fields_succeeded() {
-        let snapshot = test_snapshot(
-            Some(Ok(StatementsSample {
-                statements: Vec::new(),
-            })),
-            Some(Ok(RelationsSample {
-                tables: Vec::new(),
-                indexes: Vec::new(),
-            })),
-        );
-        assert!(slow_tier_ran(&snapshot));
-    }
-
-    #[test]
-    fn slow_tier_ran_is_true_when_the_extension_is_absent_but_relations_still_sampled() {
-        // pg_stat_statements missing leaves `statements` at `None`, but the
-        // slow tier still ran because table and index stats were sampled.
-        let snapshot = test_snapshot(
-            None,
-            Some(Err(CollectorError::Query(
-                "relation dropped mid-sample".to_string(),
-            ))),
-        );
-        assert!(slow_tier_ran(&snapshot));
-    }
-
-    #[test]
-    fn slow_tier_ran_is_true_when_both_fields_failed() {
-        let snapshot = test_snapshot(
-            Some(Err(CollectorError::Query(
-                "permission denied for view pg_stat_statements".to_string(),
-            ))),
-            Some(Err(CollectorError::Query(
-                "permission denied for relation pg_stat_user_tables".to_string(),
-            ))),
-        );
-        assert!(slow_tier_ran(&snapshot));
+    fn a_slow_tick_is_not_attempted_again_on_the_very_next_fast_tick() {
+        // `sample_loop` advances `last_slow` at the moment it decides to take
+        // the slow tick, before the query runs — so this holds regardless of
+        // whether that attempt goes on to succeed or time out. Without that,
+        // a slow-tier timeout would leave `last_slow` unset and this would
+        // fire again two seconds later, degrading into a reconnect loop.
+        let attempted_at = Instant::now();
+        let one_fast_tick_later = attempted_at + Duration::from_secs(2);
+        assert!(!is_slow_tick(
+            Some(attempted_at),
+            one_fast_tick_later,
+            Duration::from_secs(10),
+            false
+        ));
     }
 }

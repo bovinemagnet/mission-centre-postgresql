@@ -228,11 +228,13 @@ impl MissionCentrePgWindow {
     fn select_server(&self, index: i32) {
         let imp = self.imp();
 
-        // Neither banner belongs to the server about to be selected: leaving
-        // them set would let a limited-privilege server's banner survive
-        // onto a server that fails to connect entirely.
+        // Neither banner, nor either page's own privilege banner, belongs to
+        // the server about to be selected: leaving them set would let a
+        // limited-privilege server's banner survive onto a server that fails
+        // to connect entirely.
         imp.privilege_banner.set_revealed(false);
         imp.sessions_page.set_privilege_limited(false);
+        imp.queries_page.set_privilege_limited(false);
         // The below-floor warning belongs to the previously connected server;
         // clear it so it cannot survive onto the server about to be selected.
         imp.below_floor_warning.replace(None);
