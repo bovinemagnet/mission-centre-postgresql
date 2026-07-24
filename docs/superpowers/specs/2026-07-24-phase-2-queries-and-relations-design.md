@@ -82,8 +82,14 @@ The sample loop gains a second cadence controlled by a new GSettings key,
 `slow-sample-interval-ms` (default 10000). A tick is *also* a slow tick when no slow sample has been
 taken yet for this connection, or when `slow_interval` has elapsed since the last one.
 
-The first tick after connecting is always a slow tick, so both pages populate immediately rather than
-showing nothing for the first ten seconds.
+The first tick after connecting runs the **fast tier only**, and the slow tier fires on the tick after
+it — about one fast interval later, not a full slow interval. This was a correction made during
+implementation: because sampling is serial and one snapshot is emitted per tick, running the heavy
+queries on the first tick delays the Overview's first paint until all three return, up to fifteen
+seconds under the 5s `statement_timeout`. Overview is the most-used page and painted after four cheap
+queries throughout Phase 1; delaying it so that two other pages populate two seconds sooner is the
+wrong trade. The heavy pages therefore show nothing for roughly one fast interval after connecting,
+rather than for a full slow interval.
 
 Sampling stays **serial**. The heavy statements run inside the same sample as the light ones, on the
 same connection, under the same `statement_timeout`. Nothing overlaps, and the slow tier cannot cause

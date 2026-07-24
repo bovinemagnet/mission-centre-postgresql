@@ -1917,7 +1917,8 @@ git commit -m "feat: table and index statistics sampling"
   - `Snapshot.relations: Option<Result<RelationsSample, CollectorError>>`
   - `CollectorConfig { interval: Duration, slow_interval: Duration, statements_limit: i64, relations_limit: i64 }`
   - `spawn(params: ConnectionParams, password: String, config: CollectorConfig) -> CollectorHandle` — **signature change**
-  - `is_slow_tick(last_slow: Option<Instant>, now: Instant, slow_interval: Duration) -> bool`
+  - `is_slow_tick(last_slow: Option<Instant>, now: Instant, slow_interval: Duration, is_first_sample: bool) -> bool`
+  - `slow_tier_ran(snapshot: &Snapshot) -> bool`
 
 **Note on module cycles:** `snapshot.rs` will import `CollectorError` from `worker.rs`, which already imports `Snapshot` from `snapshot.rs`. Rust permits mutual references between modules of one crate; this compiles and is intentional rather than a mistake to be refactored around.
 
@@ -1927,25 +1928,31 @@ Append to the `mod tests` block at the bottom of `src/collector/worker.rs`:
 
 ```rust
     #[test]
-    fn the_first_sample_of_a_connection_always_runs_the_slow_tier() {
-        // Otherwise both heavy pages sit blank for the whole slow interval
-        // after connecting.
+    fn the_first_sample_of_a_connection_runs_the_fast_tier_only() {
+        // Sampling is serial, so waiting for the three heavy queries here
+        // would leave the Overview blank until they returned.
         let now = Instant::now();
-        assert!(is_slow_tick(None, now, Duration::from_secs(10)));
+        assert!(!is_slow_tick(None, now, Duration::from_secs(10), true));
+    }
+
+    #[test]
+    fn the_slow_tier_fires_on_the_tick_after_the_first() {
+        let now = Instant::now();
+        assert!(is_slow_tick(None, now, Duration::from_secs(10), false));
     }
 
     #[test]
     fn the_slow_tier_waits_for_its_interval() {
         let now = Instant::now();
         let recent = now - Duration::from_secs(3);
-        assert!(!is_slow_tick(Some(recent), now, Duration::from_secs(10)));
+        assert!(!is_slow_tick(Some(recent), now, Duration::from_secs(10), false));
     }
 
     #[test]
     fn the_slow_tier_runs_once_the_interval_has_elapsed() {
         let now = Instant::now();
         let stale = now - Duration::from_secs(11);
-        assert!(is_slow_tick(Some(stale), now, Duration::from_secs(10)));
+        assert!(is_slow_tick(Some(stale), now, Duration::from_secs(10), false));
     }
 
     #[test]
@@ -2039,10 +2046,21 @@ pub struct CollectorConfig {
     pub relations_limit: i64,
 }
 
-/// True when this tick should also run the slow tier: always for the first
-/// sample of a connection, so the heavy pages populate immediately, then
-/// once `slow_interval` has elapsed.
-pub fn is_slow_tick(last_slow: Option<Instant>, now: Instant, slow_interval: Duration) -> bool {
+/// True when this tick should also run the slow tier.
+///
+/// Never on a connection's first sample: sampling is serial, so waiting for
+/// the three heavy queries there would leave the Overview blank until they
+/// returned. The slow tier fires on the next tick instead — about one fast
+/// interval later — then once every `slow_interval` after that.
+pub fn is_slow_tick(
+    last_slow: Option<Instant>,
+    now: Instant,
+    slow_interval: Duration,
+    is_first_sample: bool,
+) -> bool {
+    if is_first_sample {
+        return false;
+    }
     match last_slow {
         None => true,
         Some(previous) => now.duration_since(previous) >= slow_interval,
@@ -2136,7 +2154,8 @@ async fn sample_loop(
             return Exit::Stopped;
         }
 
-        let slow = is_slow_tick(last_slow, Instant::now(), config.slow_interval).then_some(SlowTier {
+        let slow = is_slow_tick(last_slow, Instant::now(), config.slow_interval, is_first_sample)
+            .then_some(SlowTier {
             statements_available,
             statements_limit: config.statements_limit,
             relations_limit: config.relations_limit,
@@ -3748,7 +3767,9 @@ git commit -m "docs: record Phase 2 verification"
 
 Checked against `docs/superpowers/specs/2026-07-24-phase-2-queries-and-relations-design.md`:
 
-- §3.1 slow cadence — Task 5, `is_slow_tick`, with the first-tick-always rule tested.
+- §3.1 slow cadence — Task 5, `is_slow_tick`. Corrected during implementation: the first tick runs
+  the fast tier only, and the slow tier fires on the tick after it, so the Overview's first paint is
+  not delayed by three heavy queries. See the spec §3.1 for the reasoning.
 - §3.2 snapshot additions — Task 5 Step 3, including `StatementsSample`/`RelationsSample` defined in Tasks 3 and 4.
 - §3.3 failure isolation — Task 5, `classify_slow`, with three tests covering the query/timeout/lost-connection split.
 - §3.4 cost control — `LIMIT $1` in both SQL constants, `left(query, 2000)`, limits from GSettings (Task 5 Step 7).
