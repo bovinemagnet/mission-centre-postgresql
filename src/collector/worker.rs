@@ -19,8 +19,9 @@
  */
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Once;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustls::RootCertStore;
 use tokio_postgres::tls::MakeTlsConnect;
@@ -40,8 +41,17 @@ use crate::collector::statements::{
     apply_deltas, counters_by_key, map_statement, StatementCounters, StatementKey,
     StatementsSample, STATEMENTS_SQL,
 };
-use crate::connection::params::{ConnectionParams, SslMode};
+use crate::connection::params::{ConnectionParams, HistoryMode, SslMode};
 use crate::connection::probe::{map_server_info, ServerInfo, PROBE_SQL};
+use crate::history::local::LocalStore;
+use crate::history::pgconsole::{
+    map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
+    PGCONSOLE_PROBE_SQL,
+};
+use crate::history::{
+    is_history_tick, query_samples_from, system_sample_from, HistoryBackend, HistoryPreload,
+    QueryHistorySample, SystemHistorySample,
+};
 
 /// Guards against a wedged server hanging the sampler for ever.
 const STATEMENT_TIMEOUT: &str = "SET statement_timeout = '5s'";
@@ -68,6 +78,7 @@ pub enum CollectorEvent {
     Sample(Box<Snapshot>),
     Error(CollectorError),
     Disconnected,
+    History(Box<HistoryPreload>),
 }
 
 pub struct CollectorHandle {
@@ -137,12 +148,22 @@ pub fn backoff_delay(consecutive_failures: u32) -> Duration {
 /// How the collector is configured for one connection. A struct rather than
 /// four positional arguments, since three of the four are durations or
 /// limits that would be easy to transpose.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy`: the history fields add a `String` and a `PathBuf`. It is
+/// moved into the collector thread once, so `Clone` is enough.
+#[derive(Debug, Clone)]
 pub struct CollectorConfig {
     pub interval: Duration,
     pub slow_interval: Duration,
     pub statements_limit: i64,
     pub relations_limit: i64,
+    pub history_mode: HistoryMode,
+    pub history_interval: Duration,
+    pub history_retention_days: i64,
+    pub history_top_queries: usize,
+    pub server_id: String,
+    pub local_db_path: PathBuf,
+    pub preload_points: usize,
 }
 
 /// True when this tick should also run the slow tier.
@@ -204,6 +225,23 @@ fn classify_slow<T>(
     }
 }
 
+/// What a failed history write means. A `Query` error is a property of the
+/// store or the role — the schema was dropped, a privilege revoked — so
+/// history disables for the session and the sample still succeeds. A timeout
+/// or lost connection is the connection's problem and fails the sample, as
+/// everywhere else.
+enum HistoryOutcome {
+    Disable,
+    FailSample,
+}
+
+fn classify_history_error(error: CollectorError) -> HistoryOutcome {
+    match error {
+        CollectorError::Timeout | CollectorError::LostConnection => HistoryOutcome::FailSample,
+        _ => HistoryOutcome::Disable,
+    }
+}
+
 pub fn spawn(
     params: ConnectionParams,
     password: String,
@@ -261,7 +299,29 @@ async fn run(
                 if !emit(&events, &stop, CollectorEvent::Connected(info)).await {
                     return;
                 }
-                match sample_loop(&client, config, statements_available, &events, &stop).await {
+                // Resolve the effective backend and hand the UI its preload
+                // before live sampling starts, so the Overview graphs open
+                // with recent history rather than an empty axis.
+                let (mut history, preload) =
+                    open_history(&client, &config, config.preload_points).await;
+                if !emit(&events, &stop, CollectorEvent::History(Box::new(preload))).await {
+                    return;
+                }
+                // Prune the local store once per connection.
+                if let HistoryBackend::Local(store) = &history {
+                    let cutoff = retention_cutoff(config.history_retention_days);
+                    let _ = store.prune(cutoff);
+                }
+                match sample_loop(
+                    &client,
+                    &config,
+                    &mut history,
+                    statements_available,
+                    &events,
+                    &stop,
+                )
+                .await
+                {
                     Exit::Stopped => {
                         // We are already shutting down, so route this
                         // through the non-blocking path rather than emit(),
@@ -391,7 +451,8 @@ fn install_crypto_provider() {
 /// piling overlapping queries onto one connection.
 async fn sample_loop(
     client: &Client,
-    config: CollectorConfig,
+    config: &CollectorConfig,
+    history: &mut HistoryBackend,
     statements_available: bool,
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
@@ -399,6 +460,12 @@ async fn sample_loop(
     let mut previous: Option<(DatabaseCounters, Instant)> = None;
     let mut previous_statements: Option<(HashMap<StatementKey, StatementCounters>, Instant)> = None;
     let mut last_slow: Option<Instant> = None;
+    // History writes run on a coarser clock than the sample loop, and reuse the
+    // query rows from the most recent successful slow sample: the history
+    // interval (60s) is far wider than the slow interval (10s), so most history
+    // ticks have no fresh statements of their own.
+    let mut last_history: Option<Instant> = None;
+    let mut latest_queries: Vec<QueryHistorySample> = Vec::new();
     let mut consecutive_failures = 0u32;
     let mut had_success = false;
     let mut is_first_sample = true;
@@ -429,7 +496,43 @@ async fn sample_loop(
                 if let Some(Ok(sample)) = snapshot.statements.as_ref() {
                     previous_statements =
                         Some((counters_by_key(&sample.statements), snapshot.taken_at));
+                    latest_queries =
+                        query_samples_from(&sample.statements, config.history_top_queries);
                 }
+
+                // History follows its own, coarser cadence inside the serial
+                // loop. `last_history` advances the moment the tick fires —
+                // before the write — so a failed write does not retry-storm
+                // on the next tick, the same lesson as `last_slow`.
+                if !history.is_off()
+                    && is_history_tick(last_history, Instant::now(), config.history_interval)
+                {
+                    last_history = Some(Instant::now());
+                    let system = system_sample_from(&snapshot);
+                    if let Err(e) =
+                        write_history(client, history, config, &system, &latest_queries).await
+                    {
+                        match classify_history_error(e) {
+                            HistoryOutcome::Disable => {
+                                gtk_free_log(
+                                    "history write failed; disabling history for this session",
+                                );
+                                *history = HistoryBackend::Off;
+                            }
+                            HistoryOutcome::FailSample => {
+                                // A timeout here is rare, and the next loop
+                                // iteration's sample will surface a genuine
+                                // connection fault anyway. Failing the sample
+                                // from inside the history write would be more
+                                // disruptive than the fault warrants, so log
+                                // and continue: history never fails a sample on
+                                // its own account.
+                                gtk_free_log("history write timed out; skipping this write");
+                            }
+                        }
+                    }
+                }
+
                 emit_sample(events, Box::new(snapshot));
             }
             Err(e) => {
@@ -573,6 +676,152 @@ fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
         CollectorError::LostConnection
     } else {
         CollectorError::Query(e.to_string())
+    }
+}
+
+/// Resolves the effective backend for this connection and loads the recent
+/// history to preload. A pgconsole schema that is missing or unwritable falls
+/// back to Local with a logged note; the connection is never failed for it.
+async fn open_history(
+    client: &Client,
+    config: &CollectorConfig,
+    preload_limit: usize,
+) -> (HistoryBackend, HistoryPreload) {
+    match config.history_mode {
+        HistoryMode::Off => (HistoryBackend::Off, HistoryPreload::default()),
+        HistoryMode::PgConsole => match probe_pgconsole(client).await {
+            PgConsoleAvailability::Writable => {
+                let system = load_pgconsole_history(client, preload_limit).await;
+                (HistoryBackend::PgConsole, HistoryPreload { system })
+            }
+            other => {
+                gtk_free_log(&format!(
+                    "pgconsole history unavailable ({other:?}); using local history"
+                ));
+                open_local(config, preload_limit)
+            }
+        },
+        HistoryMode::Local => open_local(config, preload_limit),
+    }
+}
+
+async fn probe_pgconsole(client: &Client) -> PgConsoleAvailability {
+    match client.query_one(PGCONSOLE_PROBE_SQL, &[]).await {
+        Ok(row) => PgConsoleAvailability::classify(row.get("tables_exist"), row.get("can_insert")),
+        // A probe that itself errors is treated as no usable schema.
+        Err(_) => PgConsoleAvailability::SchemaMissing,
+    }
+}
+
+async fn load_pgconsole_history(client: &Client, limit: usize) -> Vec<SystemHistorySample> {
+    match client.query(LOAD_SYSTEM_SQL, &[&(limit as i64)]).await {
+        Ok(rows) => {
+            let mut samples: Vec<SystemHistorySample> = rows.iter().map(map_system_row).collect();
+            samples.reverse(); // newest-first from SQL → oldest-first
+            samples
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn open_local(config: &CollectorConfig, preload_limit: usize) -> (HistoryBackend, HistoryPreload) {
+    match LocalStore::open(&config.local_db_path) {
+        Ok(store) => {
+            let system = store
+                .load_recent_system(&config.server_id, preload_limit)
+                .unwrap_or_default();
+            (HistoryBackend::Local(store), HistoryPreload { system })
+        }
+        Err(e) => {
+            gtk_free_log(&format!(
+                "local history unavailable ({e}); history disabled"
+            ));
+            (HistoryBackend::Off, HistoryPreload::default())
+        }
+    }
+}
+
+/// A log line from the collector thread. `g_warning!` is GTK-thread-only, so
+/// the collector uses eprintln through the glib logger's stderr, never a GTK
+/// call. Kept in one place so the GTK-free rule is easy to check.
+fn gtk_free_log(message: &str) {
+    eprintln!("mission-centre-pg: {message}");
+}
+
+/// Unix-epoch second before which local history rows are pruned. Uses wall
+/// clock, which is correct for a retention window; the sample loop's Instant
+/// timing is monotonic and unrelated.
+fn retention_cutoff(retention_days: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now - retention_days * 86_400
+}
+
+/// Writes one system row and the latest query rows to whichever backend is
+/// active. Local writes are synchronous SQLite calls run inline — they are
+/// small and infrequent (default 60s) and the loop is serial, so a brief
+/// block is acceptable and simpler than a blocking-pool hop. pgconsole writes
+/// go over the existing client.
+async fn write_history(
+    client: &Client,
+    history: &HistoryBackend,
+    config: &CollectorConfig,
+    system: &SystemHistorySample,
+    queries: &[QueryHistorySample],
+) -> Result<(), CollectorError> {
+    let sampled_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match history {
+        HistoryBackend::Off => Ok(()),
+        HistoryBackend::Local(store) => store
+            .write_system(&config.server_id, sampled_at, system)
+            .and_then(|_| store.write_queries(&config.server_id, sampled_at, queries))
+            .map_err(|e| CollectorError::Query(e.to_string())),
+        HistoryBackend::PgConsole => {
+            client
+                .execute(
+                    INSERT_SYSTEM_SQL,
+                    &[
+                        &config.server_id,
+                        &system.total_connections,
+                        &system.max_connections,
+                        &system.active_queries,
+                        &system.idle_connections,
+                        &system.idle_in_transaction,
+                        &system.cache_hit_ratio,
+                        &system.total_database_size_bytes,
+                    ],
+                )
+                .await
+                .map_err(map_query_error)?;
+            for q in queries {
+                // query_id is NOT NULL in pg-console's schema; skip the
+                // text-hashed utility statements that have no queryid.
+                let Some(id) = q.query_id else { continue };
+                client
+                    .execute(
+                        INSERT_QUERY_SQL,
+                        &[
+                            &config.server_id,
+                            &id.to_string(),
+                            &q.query_text,
+                            &q.total_calls,
+                            &q.total_time_ms,
+                            &q.total_rows,
+                            &q.mean_time_ms,
+                            &q.shared_blks_hit,
+                            &q.shared_blks_read,
+                        ],
+                    )
+                    .await
+                    .map_err(map_query_error)?;
+            }
+            Ok(())
+        }
     }
 }
 

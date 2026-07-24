@@ -290,6 +290,15 @@ impl MissionCentrePgWindow {
             ),
             statements_limit: settings.int("statements-limit").max(10) as i64,
             relations_limit: settings.int("relations-limit").max(10) as i64,
+            // History configuration is wired to GSettings in a later task;
+            // for now the collector reads inert defaults with history off.
+            history_mode: mission_centre_pg::connection::params::HistoryMode::Off,
+            history_interval: std::time::Duration::from_secs(60),
+            history_retention_days: 7,
+            history_top_queries: 50,
+            server_id: String::new(),
+            local_db_path: std::env::temp_dir().join("mission-centre-pg-history.db"),
+            preload_points: 300,
         };
 
         // Every event this collector ever emits is stamped with this
@@ -411,6 +420,11 @@ impl MissionCentrePgWindow {
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Disconnected);
                 }
+            }
+            CollectorEvent::History(_preload) => {
+                // A later task feeds the preload into the Overview graph
+                // buffers; for now the collector emits it and the window
+                // accepts it without acting on it.
             }
         }
     }

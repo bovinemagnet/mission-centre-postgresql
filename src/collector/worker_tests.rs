@@ -21,6 +21,32 @@
 use super::*;
 
 #[test]
+fn a_pgconsole_write_failure_disables_history_without_failing_the_sample() {
+    // A mid-session INSERT failure (schema dropped, privilege revoked) is
+    // a property of the store, not the connection: history goes Off and
+    // the sample still succeeds. Classified exactly like a slow-tier
+    // Query error.
+    let outcome = classify_history_error(CollectorError::Query("permission denied".into()));
+    assert!(matches!(outcome, HistoryOutcome::Disable));
+}
+
+#[test]
+fn a_pgconsole_write_timeout_still_fails_the_sample() {
+    assert!(matches!(
+        classify_history_error(CollectorError::Timeout),
+        HistoryOutcome::FailSample
+    ));
+}
+
+#[test]
+fn a_pgconsole_write_connection_loss_still_fails_the_sample() {
+    assert!(matches!(
+        classify_history_error(CollectorError::LostConnection),
+        HistoryOutcome::FailSample
+    ));
+}
+
+#[test]
 fn backoff_doubles_and_then_caps_at_thirty_seconds() {
     assert_eq!(backoff_delay(0), Duration::from_secs(1));
     assert_eq!(backoff_delay(1), Duration::from_secs(2));
