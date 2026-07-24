@@ -20,7 +20,9 @@
 
 pub mod format;
 pub mod overview;
+pub mod queries;
 pub mod sessions;
 
 pub use overview::McpgOverviewPage;
+pub use queries::McpgQueriesPage;
 pub use sessions::McpgSessionsPage;

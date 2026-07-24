@@ -31,7 +31,7 @@ use mission_centre_pg::collector::worker::{
 use mission_centre_pg::connection::params::ConnectionParams;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
-use mission_centre_pg::pages::{McpgOverviewPage, McpgSessionsPage};
+use mission_centre_pg::pages::{McpgOverviewPage, McpgQueriesPage, McpgSessionsPage};
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
 use mission_centre_pg::i18n::{i18n, i18n_f};
@@ -56,6 +56,8 @@ mod imp {
         pub overview_page: TemplateChild<McpgOverviewPage>,
         #[template_child]
         pub sessions_page: TemplateChild<McpgSessionsPage>,
+        #[template_child]
+        pub queries_page: TemplateChild<McpgQueriesPage>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -74,6 +76,9 @@ mod imp {
         /// it is re-asserted after each successful `Sample` rather than being
         /// cleared. Reset to `None` on a server switch or a fresh connection.
         pub below_floor_warning: RefCell<Option<String>>,
+        /// The database of the currently selected server, for messages that
+        /// name it. Extension presence is a per-database property.
+        pub connected_database: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -85,6 +90,7 @@ mod imp {
         fn class_init(klass: &mut Self::Class) {
             McpgOverviewPage::ensure_type();
             McpgSessionsPage::ensure_type();
+            McpgQueriesPage::ensure_type();
             klass.bind_template();
         }
 
@@ -233,6 +239,7 @@ impl MissionCentrePgWindow {
         let Some(params) = imp.servers.borrow().get(index as usize).cloned() else {
             return;
         };
+        imp.connected_database.replace(params.database.clone());
 
         // Clear the sparkline before the new collector's first sample
         // arrives: without this, re-selecting a row after time spent on a
@@ -326,6 +333,11 @@ impl MissionCentrePgWindow {
                     "Connected without pg_monitor — query text and statistics for other users' sessions are hidden.",
                 ));
                 imp.sessions_page.set_privilege_limited(limited);
+                imp.queries_page.set_privilege_limited(limited);
+                imp.queries_page.set_statements_availability(
+                    &info.statements,
+                    &imp.connected_database.borrow(),
+                );
 
                 if info.is_below_floor() {
                     let message = i18n_f(
@@ -352,6 +364,13 @@ impl MissionCentrePgWindow {
                 }
                 imp.overview_page.update(&snapshot);
                 imp.sessions_page.update(&snapshot.sessions);
+                // None means this was a fast tick, so the page keeps what it
+                // has. Err means the slow tier ran and failed.
+                match snapshot.statements.as_ref() {
+                    Some(Ok(sample)) => imp.queries_page.update(sample),
+                    Some(Err(error)) => imp.queries_page.set_error(&i18n(&error.to_string())),
+                    None => {}
+                }
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);

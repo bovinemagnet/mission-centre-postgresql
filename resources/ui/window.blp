@@ -65,6 +65,13 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
             icon-name: "view-list-symbolic";
             child: $McpgSessionsPage sessions_page {};
           }
+
+          Adw.ViewStackPage {
+            name: "queries";
+            title: _("Queries");
+            icon-name: "format-justify-left-symbolic";
+            child: $McpgQueriesPage queries_page {};
+          }
         };
       };
     };

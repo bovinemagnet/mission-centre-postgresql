@@ -6,6 +6,7 @@ blueprints = custom_target(
     'ui/add_server_dialog.blp',
     'ui/overview_page.blp',
     'ui/sessions_page.blp',
+    'ui/queries_page.blp',
   ),
   output: '.',
   command: [blueprint_compiler, 'batch-compile', '@OUTPUT@', '@CURRENT_SOURCE_DIR@', '@INPUT@'],
