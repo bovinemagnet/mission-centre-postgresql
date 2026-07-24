@@ -26,7 +26,7 @@ use gtk::glib;
 use uuid::Uuid;
 
 use crate::connection::credentials;
-use crate::connection::params::{ConnectionParams, SslMode};
+use crate::connection::params::{ConnectionParams, HistoryMode, SslMode};
 use crate::i18n::i18n;
 
 type AddedCallback = Box<dyn Fn(&ConnectionParams)>;
@@ -155,6 +155,7 @@ impl McpgAddServerDialog {
                 2 => SslMode::Require,
                 _ => SslMode::Prefer,
             },
+            history: HistoryMode::Off,
         };
 
         // The password goes straight to the secret store and is never held on
