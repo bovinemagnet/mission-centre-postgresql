@@ -19,4 +19,5 @@
  */
 
 pub mod local;
+pub mod pgconsole;
 pub mod sample;
