@@ -283,16 +283,27 @@ mod tests {
             },
         ];
         store.write_queries("srv", 1_000, &samples).unwrap();
-        // Round-trip is proven via a direct count, since Phase 3 renders no
-        // query-history view to load them back through.
-        let count: i64 = store
+        // Round-trip is proven via direct row reads, since Phase 3 renders no
+        // query-history view to load them back through. Ordering by
+        // total_calls descending makes the two rows deterministic.
+        let mut statement = store
             .connection()
-            .query_row(
-                "SELECT count(*) FROM query_history WHERE server_id = 'srv'",
-                [],
-                |r| r.get(0),
+            .prepare(
+                "SELECT query_id, query_text, total_calls FROM query_history
+                  WHERE server_id = 'srv'
+                  ORDER BY total_calls DESC",
             )
             .unwrap();
-        assert_eq!(count, 2);
+        let rows: Vec<(Option<i64>, String, i64)> = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (Some(42), "SELECT 1".to_string(), 10));
+        // The query_id column must read back as SQL NULL, not a sentinel
+        // such as zero.
+        assert_eq!(rows[1], (None, "VACUUM t".to_string(), 1));
     }
 }
