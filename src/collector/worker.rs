@@ -166,6 +166,27 @@ pub fn is_slow_tick(
     }
 }
 
+/// Decides whether this tick runs the slow tier, and records the attempt.
+///
+/// The recording happens here, at the decision, rather than after the sample
+/// returns: a slow-tier timeout produces no snapshot, and inferring the
+/// attempt from one would leave `last_slow` unadvanced and retry the heavy
+/// queries on the next fast tick, two seconds later. Three of those reach
+/// the disconnect threshold, so one slow view would cost the whole
+/// connection.
+fn take_slow_tick(
+    last_slow: &mut Option<Instant>,
+    now: Instant,
+    slow_interval: Duration,
+    is_first_sample: bool,
+) -> bool {
+    let attempt = is_slow_tick(*last_slow, now, slow_interval, is_first_sample);
+    if attempt {
+        *last_slow = Some(now);
+    }
+    attempt
+}
+
 /// A slow-tier failure degrades one page rather than the connection. Only a
 /// timeout or a lost connection is allowed to fail the whole sample; a query
 /// error — insufficient privilege, an extension dropped mid-session, a
@@ -388,21 +409,17 @@ async fn sample_loop(
         }
 
         let now = Instant::now();
-        let slow = is_slow_tick(last_slow, now, config.slow_interval, is_first_sample).then(|| {
-            // Record the attempt here, not from the outcome: a slow tick
-            // that times out still needs `last_slow` advanced, or
-            // `is_slow_tick` would fire again on the very next fast tick
-            // and turn one slow query into a permanent reconnect loop.
-            last_slow = Some(now);
-            SlowTier {
-                statements_available,
-                statements_limit: config.statements_limit,
-                relations_limit: config.relations_limit,
-                previous_statements: previous_statements
-                    .as_ref()
-                    .map(|(counters, at)| (counters, *at)),
-            }
-        });
+        let slow =
+            take_slow_tick(&mut last_slow, now, config.slow_interval, is_first_sample).then(|| {
+                SlowTier {
+                    statements_available,
+                    statements_limit: config.statements_limit,
+                    relations_limit: config.relations_limit,
+                    previous_statements: previous_statements
+                        .as_ref()
+                        .map(|(counters, at)| (counters, *at)),
+                }
+            });
 
         match sample(client, previous, slow).await {
             Ok(snapshot) => {
@@ -683,19 +700,59 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_tick_is_not_attempted_again_on_the_very_next_fast_tick() {
-        // `sample_loop` advances `last_slow` at the moment it decides to take
-        // the slow tick, before the query runs — so this holds regardless of
-        // whether that attempt goes on to succeed or time out. Without that,
-        // a slow-tier timeout would leave `last_slow` unset and this would
-        // fire again two seconds later, degrading into a reconnect loop.
+    fn an_attempted_slow_tick_advances_last_slow_so_the_next_fast_tick_is_refused() {
+        // Advancing `last_slow` at the moment the tick is attempted — rather
+        // than after the sample returns — is exactly the fix this guards: a
+        // slow-tier timeout produces no snapshot, so if the assignment lived
+        // in the `Ok` arm instead, `last_slow` would stay unset and this
+        // would attempt again on the very next fast tick, two seconds later.
+        let mut last_slow = None;
         let attempted_at = Instant::now();
+
+        assert!(take_slow_tick(
+            &mut last_slow,
+            attempted_at,
+            Duration::from_secs(10),
+            false
+        ));
+        assert_eq!(last_slow, Some(attempted_at));
+
         let one_fast_tick_later = attempted_at + Duration::from_secs(2);
-        assert!(!is_slow_tick(
-            Some(attempted_at),
+        assert!(!take_slow_tick(
+            &mut last_slow,
             one_fast_tick_later,
             Duration::from_secs(10),
             false
         ));
+        assert_eq!(last_slow, Some(attempted_at));
+    }
+
+    #[test]
+    fn the_first_sample_neither_attempts_nor_advances_last_slow() {
+        let mut last_slow = None;
+        let now = Instant::now();
+
+        assert!(!take_slow_tick(
+            &mut last_slow,
+            now,
+            Duration::from_secs(10),
+            true
+        ));
+        assert_eq!(last_slow, None);
+    }
+
+    #[test]
+    fn a_tick_inside_the_interval_neither_attempts_nor_advances_last_slow() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(3);
+        let mut last_slow = Some(recent);
+
+        assert!(!take_slow_tick(
+            &mut last_slow,
+            now,
+            Duration::from_secs(10),
+            false
+        ));
+        assert_eq!(last_slow, Some(recent));
     }
 }

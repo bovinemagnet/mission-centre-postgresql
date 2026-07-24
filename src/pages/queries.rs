@@ -334,19 +334,21 @@ impl McpgQueriesPage {
 
     fn rebuild_rows(&self) {
         let imp = self.imp();
-        let statements = imp.statements.borrow();
-        // Self-heals on the next slow sample without touching the toggle,
-        // which stays "Last interval" throughout: that is still what the
-        // user selected, and what they get as soon as a delta exists.
-        let delta_mode = effective_delta_mode(imp.delta_mode.get(), &statements);
-        let rows: Vec<QueryRow> = statements
-            .iter()
-            .cloned()
-            .map(|statement| QueryRow {
-                statement,
-                delta_mode,
-            })
-            .collect();
+        let rows: Vec<QueryRow> = {
+            let statements = imp.statements.borrow();
+            // Self-heals on the next slow sample without touching the toggle,
+            // which stays "Last interval" throughout: that is still what the
+            // user selected, and what they get as soon as a delta exists.
+            let delta_mode = effective_delta_mode(imp.delta_mode.get(), &statements);
+            statements
+                .iter()
+                .cloned()
+                .map(|statement| QueryRow {
+                    statement,
+                    delta_mode,
+                })
+                .collect()
+        };
         if let Some(table) = imp.table.borrow().as_ref() {
             table.update(&rows);
         }
