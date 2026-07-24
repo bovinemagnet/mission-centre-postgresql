@@ -106,16 +106,20 @@ and never fails the connection.
 ### 4.1 The probe
 
 On connect, after the existing privilege and statements probes, a history probe runs when — and only
-when — the server's mode is pgconsole. It checks three things in one round trip:
+when — the server's mode is pgconsole. It checks two things in one round trip:
 
 - the `pgconsole.system_metrics_history` and `pgconsole.query_metrics_history` tables exist;
-- they carry the columns Phase 3 writes (§5), by name;
 - the connected role may `INSERT` into them (`has_table_privilege(..., 'INSERT')`).
+
+Column names are **not** audited in the probe. Each `INSERT` names its columns explicitly, so a
+renamed or removed column fails that write and history disables for the session (§4.2, §8). Probing
+table existence and INSERT privilege catches the two common cases — no schema, and a read-only role —
+without a column-by-column `information_schema` audit that the tests do not exercise.
 
 ```rust
 pub enum PgConsoleAvailability {
     Writable,
-    SchemaMissing,       // no pgconsole schema, or not the expected tables/columns
+    SchemaMissing,       // no pgconsole schema, or not the expected history tables
     NotWritable,         // schema present but the role cannot INSERT
 }
 ```
@@ -129,9 +133,9 @@ schema the user did not ask to use.
 Mission Centre reads and writes pg-console's tables but never owns their shape. It writes a fixed set
 of columns by name and never `SELECT *`, so extra pg-console columns are ignored and a pg-console
 migration that *adds* columns does not break Mission Centre. A migration that *renames or removes* a
-column Phase 3 writes is caught by the probe (§4.1), which then reports `SchemaMissing` and Mission
-Centre falls back to Local. The columns Phase 3 depends on are the ones present in pg-console's
-`V1__initial_schema.sql` and are listed in §5.
+column Phase 3 writes is caught at **write time** rather than by the probe: the `INSERT` names its
+columns, so it fails, and Mission Centre disables history for the session (§8). The columns Phase 3
+depends on are the ones present in pg-console's `V1__initial_schema.sql` and are listed in §5.
 
 Rows Mission Centre writes carry `instance_id = <server UUID>`, distinct from pg-console's default
 `'default'`, so the two tools' rows are always distinguishable. Preload (§6.1) reads the server's
@@ -194,8 +198,10 @@ enum HistoryBackend {
 ```
 
 and calls backend-appropriate code at two points: **load** (once, on connect) and **write** (at the
-history cadence, inside the serial sample loop). Local's blocking SQLite calls run under
-`spawn_blocking`; pgconsole's INSERTs reuse the client the sample loop already holds.
+history cadence, inside the serial sample loop). Local's SQLite calls run inline: they are small and
+infrequent (default 60s), and the sample loop is serial, so a brief synchronous block is acceptable
+and simpler than a blocking-pool hop. pgconsole's INSERTs reuse the client the sample loop already
+holds.
 
 On connect, after `Connected`, the collector loads the most recent history for this server and emits
 it once:
@@ -300,7 +306,7 @@ Additions to the parent spec §8 and Phase 2 §11:
 |-----------|-----------|
 | Local SQLite open or write fails | History for that server is disabled for the session; a one-line warning is logged (never the path's contents). Sampling and the UI continue unaffected |
 | pgconsole probe reports SchemaMissing / NotWritable | Effective backend falls back to Local with a note (§6.3). The connection is not failed |
-| A pgconsole INSERT fails mid-session (schema dropped, privilege revoked) | Treated like a slow-tier `Query` error (Phase 2 §3.3): it degrades history for that server, not the connection. History falls back to Local for the rest of the session |
+| A pgconsole INSERT fails mid-session (schema dropped, privilege revoked) | Treated like a slow-tier `Query` error (Phase 2 §3.3): it degrades history, not the connection. History is **disabled** for the rest of the session — distinct from the connect-time fallback, which opens Local before any writing has begun. Disabling, rather than opening Local mid-loop, is what success criterion §10.7 asserts |
 | The XDG data directory cannot be created | Local history is disabled; logged once. The application runs normally without history |
 | A history write would exceed the cadence during a slow sample | It waits for the next eligible tick; history writes never overlap a sample or each other, because they run inside the serial loop |
 | Any history error surfaced to a log | Must never include a password or a full connection string — the same rule as everywhere else |
