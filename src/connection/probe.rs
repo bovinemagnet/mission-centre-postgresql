@@ -27,7 +27,9 @@ pub const MIN_SUPPORTED_VERSION: i32 = 140000;
 pub const PROBE_SQL: &str = "\
 SELECT current_setting('server_version_num')::int AS version_num,
        pg_has_role(current_user, 'pg_monitor', 'member') AS is_monitor,
-       COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) AS is_superuser";
+       COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) AS is_superuser,
+       (SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements')
+         AS statements_version";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegeLevel {
@@ -55,11 +57,57 @@ impl PrivilegeLevel {
     }
 }
 
+/// The `pg_stat_statements` columns this project reads — `total_exec_time`
+/// and `mean_exec_time` — arrived in extension version 1.8. A server at or
+/// above the PostgreSQL 14 floor can still carry 1.7 through a `pg_upgrade`
+/// that never ran `ALTER EXTENSION … UPDATE`.
+pub const MINIMUM_STATEMENTS_VERSION: (u32, u32) = (1, 8);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementsAvailability {
+    Available { version: String },
+    TooOld { version: String },
+    NotInstalled,
+}
+
+impl StatementsAvailability {
+    pub fn classify(extversion: Option<&str>) -> Self {
+        let Some(version) = extversion else {
+            return StatementsAvailability::NotInstalled;
+        };
+        match parse_extension_version(version) {
+            Some(parsed) if parsed >= MINIMUM_STATEMENTS_VERSION => {
+                StatementsAvailability::Available {
+                    version: version.to_string(),
+                }
+            }
+            _ => StatementsAvailability::TooOld {
+                version: version.to_string(),
+            },
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, StatementsAvailability::Available { .. })
+    }
+}
+
+/// Extension versions are `major.minor`. Comparison must be numeric per
+/// component: as text "1.10" sorts before "1.8", which would reject an
+/// extension newer than the floor.
+fn parse_extension_version(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     pub version_num: i32,
     pub version_display: String,
     pub privilege: PrivilegeLevel,
+    pub statements: StatementsAvailability,
 }
 
 impl ServerInfo {
@@ -80,10 +128,12 @@ pub fn map_server_info(row: &Row) -> ServerInfo {
     let version_num: i32 = row.get("version_num");
     let is_monitor: bool = row.get("is_monitor");
     let is_superuser: bool = row.get("is_superuser");
+    let statements_version: Option<String> = row.get("statements_version");
     ServerInfo {
         version_num,
         version_display: format_version(version_num),
         privilege: PrivilegeLevel::classify(is_superuser, is_monitor),
+        statements: StatementsAvailability::classify(statements_version.as_deref()),
     }
 }
 
@@ -135,6 +185,7 @@ mod tests {
             version_num: 130015,
             version_display: format_version(130015),
             privilege: PrivilegeLevel::Superuser,
+            statements: StatementsAvailability::NotInstalled,
         };
         assert!(server_13.is_below_floor());
 
@@ -142,6 +193,7 @@ mod tests {
             version_num: 140000,
             version_display: format_version(140000),
             privilege: PrivilegeLevel::Superuser,
+            statements: StatementsAvailability::NotInstalled,
         };
         assert!(!server_14.is_below_floor());
 
@@ -149,7 +201,72 @@ mod tests {
             version_num: 180000,
             version_display: format_version(180000),
             privilege: PrivilegeLevel::Superuser,
+            statements: StatementsAvailability::NotInstalled,
         };
         assert!(!server_18.is_below_floor());
+    }
+
+    #[test]
+    fn an_absent_extension_is_not_installed() {
+        assert_eq!(
+            StatementsAvailability::classify(None),
+            StatementsAvailability::NotInstalled
+        );
+    }
+
+    #[test]
+    fn version_1_8_and_later_are_available() {
+        for version in ["1.8", "1.9", "1.11"] {
+            assert_eq!(
+                StatementsAvailability::classify(Some(version)),
+                StatementsAvailability::Available {
+                    version: version.to_string()
+                },
+                "{version} should be usable"
+            );
+        }
+    }
+
+    #[test]
+    fn version_1_10_is_available_despite_sorting_before_1_8_as_text() {
+        // The case that catches lexical comparison: "1.10" < "1.8" as text,
+        // so a string compare would reject a newer extension than the floor.
+        assert_eq!(
+            StatementsAvailability::classify(Some("1.10")),
+            StatementsAvailability::Available {
+                version: "1.10".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn version_1_7_is_too_old() {
+        // 1.7 predates total_exec_time, so the query fails on a missing
+        // column rather than a missing view.
+        assert_eq!(
+            StatementsAvailability::classify(Some("1.7")),
+            StatementsAvailability::TooOld {
+                version: "1.7".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unparseable_version_is_treated_as_too_old() {
+        // Better to show the upgrade remedy than to run a query every ten
+        // seconds that is going to fail on a column we cannot prove exists.
+        assert_eq!(
+            StatementsAvailability::classify(Some("banana")),
+            StatementsAvailability::TooOld {
+                version: "banana".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_available_variant_reports_itself_usable() {
+        assert!(StatementsAvailability::classify(Some("1.9")).is_available());
+        assert!(!StatementsAvailability::classify(Some("1.7")).is_available());
+        assert!(!StatementsAvailability::classify(None).is_available());
     }
 }

@@ -25,11 +25,15 @@ use adw::subclass::prelude::*;
 use gtk::prelude::{Cast, IsA};
 use gtk::{gio, glib};
 
-use mission_centre_pg::collector::worker::{spawn, CollectorEvent, CollectorHandle};
+use mission_centre_pg::collector::worker::{
+    spawn, CollectorConfig, CollectorEvent, CollectorHandle,
+};
 use mission_centre_pg::connection::params::ConnectionParams;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
-use mission_centre_pg::pages::{McpgOverviewPage, McpgSessionsPage};
+use mission_centre_pg::pages::{
+    McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
+};
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
 use mission_centre_pg::i18n::{i18n, i18n_f};
@@ -54,6 +58,10 @@ mod imp {
         pub overview_page: TemplateChild<McpgOverviewPage>,
         #[template_child]
         pub sessions_page: TemplateChild<McpgSessionsPage>,
+        #[template_child]
+        pub queries_page: TemplateChild<McpgQueriesPage>,
+        #[template_child]
+        pub relations_page: TemplateChild<McpgRelationsPage>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -72,6 +80,9 @@ mod imp {
         /// it is re-asserted after each successful `Sample` rather than being
         /// cleared. Reset to `None` on a server switch or a fresh connection.
         pub below_floor_warning: RefCell<Option<String>>,
+        /// The database of the currently selected server, for messages that
+        /// name it. Extension presence is a per-database property.
+        pub connected_database: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -83,6 +94,8 @@ mod imp {
         fn class_init(klass: &mut Self::Class) {
             McpgOverviewPage::ensure_type();
             McpgSessionsPage::ensure_type();
+            McpgQueriesPage::ensure_type();
+            McpgRelationsPage::ensure_type();
             klass.bind_template();
         }
 
@@ -215,11 +228,13 @@ impl MissionCentrePgWindow {
     fn select_server(&self, index: i32) {
         let imp = self.imp();
 
-        // Neither banner belongs to the server about to be selected: leaving
-        // them set would let a limited-privilege server's banner survive
-        // onto a server that fails to connect entirely.
+        // Neither banner, nor either page's own privilege banner, belongs to
+        // the server about to be selected: leaving them set would let a
+        // limited-privilege server's banner survive onto a server that fails
+        // to connect entirely.
         imp.privilege_banner.set_revealed(false);
         imp.sessions_page.set_privilege_limited(false);
+        imp.queries_page.set_privilege_limited(false);
         // The below-floor warning belongs to the previously connected server;
         // clear it so it cannot survive onto the server about to be selected.
         imp.below_floor_warning.replace(None);
@@ -231,6 +246,7 @@ impl MissionCentrePgWindow {
         let Some(params) = imp.servers.borrow().get(index as usize).cloned() else {
             return;
         };
+        imp.connected_database.replace(params.database.clone());
 
         // Clear the sparkline before the new collector's first sample
         // arrives: without this, re-selecting a row after time spent on a
@@ -239,6 +255,16 @@ impl MissionCentrePgWindow {
         if let Some(row) = self.selected_row() {
             row.reset_series();
         }
+
+        // Clear the queries page too: its rows belong to the server just
+        // left, and the slow tier will not refresh them for up to one slow
+        // interval, during which the old server's statistics would sit
+        // under the new connection with nothing to mark them stale.
+        imp.queries_page.clear();
+        // Clear the relations page for the same reason: its rows also belong
+        // to the server just left, and are also refreshed only on the slow
+        // tier.
+        imp.relations_page.clear();
 
         let password = match credentials::fetch_password(&params.id) {
             Ok(password) => password.unwrap_or_default(),
@@ -254,9 +280,17 @@ impl MissionCentrePgWindow {
             }
         };
 
-        let interval = std::time::Duration::from_millis(
-            self.settings().int("sample-interval-ms").max(500) as u64,
-        );
+        let settings = self.settings();
+        let config = CollectorConfig {
+            interval: std::time::Duration::from_millis(
+                settings.int("sample-interval-ms").max(500) as u64
+            ),
+            slow_interval: std::time::Duration::from_millis(
+                settings.int("slow-sample-interval-ms").max(2000) as u64,
+            ),
+            statements_limit: settings.int("statements-limit").max(10) as i64,
+            relations_limit: settings.int("relations-limit").max(10) as i64,
+        };
 
         // Every event this collector ever emits is stamped with this
         // generation; the event loop below discards anything that arrives
@@ -264,7 +298,7 @@ impl MissionCentrePgWindow {
         let generation = imp.generation.get().saturating_add(1);
         imp.generation.set(generation);
 
-        let handle = spawn(params, password, interval);
+        let handle = spawn(params, password, config);
         let events = handle.events.clone();
         imp.collector.replace(Some(handle));
 
@@ -316,6 +350,13 @@ impl MissionCentrePgWindow {
                     "Connected without pg_monitor — query text and statistics for other users' sessions are hidden.",
                 ));
                 imp.sessions_page.set_privilege_limited(limited);
+                imp.queries_page.set_privilege_limited(limited);
+                imp.queries_page.set_statements_availability(
+                    &info.statements,
+                    &imp.connected_database.borrow(),
+                );
+                imp.relations_page
+                    .set_database(&imp.connected_database.borrow());
 
                 if info.is_below_floor() {
                     let message = i18n_f(
@@ -342,6 +383,18 @@ impl MissionCentrePgWindow {
                 }
                 imp.overview_page.update(&snapshot);
                 imp.sessions_page.update(&snapshot.sessions);
+                // None means this was a fast tick, so the page keeps what it
+                // has. Err means the slow tier ran and failed.
+                match snapshot.statements.as_ref() {
+                    Some(Ok(sample)) => imp.queries_page.update(sample),
+                    Some(Err(error)) => imp.queries_page.set_error(&i18n(&error.to_string())),
+                    None => {}
+                }
+                match snapshot.relations.as_ref() {
+                    Some(Ok(sample)) => imp.relations_page.update(sample),
+                    Some(Err(error)) => imp.relations_page.set_error(&i18n(&error.to_string())),
+                    None => {}
+                }
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);

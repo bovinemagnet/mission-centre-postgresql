@@ -1,0 +1,58 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgQueriesPage: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Stack stack {
+    Gtk.StackPage {
+      name: "table";
+
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.Box {
+          spacing: 12;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 12;
+          margin-bottom: 6;
+
+          Gtk.SearchEntry filter_entry {
+            hexpand: true;
+            placeholder-text: _("Filter by query text, user or database");
+          }
+
+          Gtk.ToggleButton interval_toggle {
+            label: _("Last interval");
+            active: true;
+            tooltip-text: _("Show activity during the last sampling interval rather than totals since the statistics were reset");
+          }
+        }
+
+        Adw.Banner privilege_note {
+          revealed: false;
+          title: _("Query text for other users' statements is hidden without pg_monitor.");
+        }
+
+        Gtk.ScrolledWindow {
+          vexpand: true;
+
+          child: Gtk.ColumnView column_view {
+            show-column-separators: true;
+            reorderable: false;
+          };
+        }
+      };
+    }
+
+    Gtk.StackPage {
+      name: "unavailable";
+
+      child: Adw.StatusPage status_page {
+        icon-name: "dialog-information-symbolic";
+        vexpand: true;
+      };
+    }
+  }
+}

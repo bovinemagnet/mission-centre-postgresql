@@ -6,5 +6,7 @@
     <file preprocess="xml-stripblanks">ui/add_server_dialog.ui</file>
     <file preprocess="xml-stripblanks">ui/overview_page.ui</file>
     <file preprocess="xml-stripblanks">ui/sessions_page.ui</file>
+    <file preprocess="xml-stripblanks">ui/queries_page.ui</file>
+    <file preprocess="xml-stripblanks">ui/relations_page.ui</file>
   </gresource>
 </gresources>

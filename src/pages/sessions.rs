@@ -19,99 +19,75 @@
  */
 
 use std::cell::{Cell, RefCell};
-use std::cmp::Ordering;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::prelude::{Cast, CastNone};
-use gtk::{gio, glib};
+use gtk::glib;
 
 use crate::collector::snapshot::Session;
+use crate::table::{Column, Table};
 
-glib::wrapper! {
-    pub struct SessionObject(ObjectSubclass<session_object::SessionObject>);
-}
-
-mod session_object {
-    use super::*;
-    use std::cell::RefCell;
-
-    #[derive(Default)]
-    pub struct SessionObject {
-        pub session: RefCell<Option<Session>>,
-    }
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for SessionObject {
-        const NAME: &'static str = "McpgSessionObject";
-        type Type = super::SessionObject;
-    }
-
-    impl ObjectImpl for SessionObject {}
-}
-
-impl SessionObject {
-    pub fn new(session: Session) -> Self {
-        let object: Self = glib::Object::new();
-        object.imp().session.replace(Some(session));
-        object
-    }
-
-    pub fn session(&self) -> Session {
-        self.imp()
-            .session
-            .borrow()
-            .clone()
-            .expect("SessionObject always holds a session")
-    }
-}
-
-/// How a session renders as text in a column cell.
-type Renderer = fn(&Session) -> String;
-/// Extracts a numeric sort key from a session, for columns that must sort
-/// numerically rather than lexically (so "10" sorts after "9").
-type NumericKey = fn(&Session) -> f64;
-
-/// Column definitions: title, how to render a session as text, and — for
-/// columns whose values are numbers rather than words — how to extract a
-/// numeric key so header clicks sort them numerically.
-const COLUMNS: &[(&str, Renderer, Option<NumericKey>)] = &[
-    ("PID", |s| s.pid.to_string(), Some(|s| s.pid as f64)),
-    ("User", |s| s.user_name.clone().unwrap_or_default(), None),
-    ("Database", |s| s.database.clone().unwrap_or_default(), None),
-    (
-        "Application",
-        |s| s.application_name.clone().unwrap_or_default(),
-        None,
-    ),
-    (
-        "Client",
-        |s| s.client_addr.clone().unwrap_or_else(|| "local".to_string()),
-        None,
-    ),
-    ("State", |s| s.state.clone().unwrap_or_default(), None),
-    (
-        "Wait",
-        |s| match (&s.wait_event_type, &s.wait_event) {
+const COLUMNS: &[Column<Session>] = &[
+    Column {
+        title: "PID",
+        render: |s| s.pid.to_string(),
+        sort_key: Some(|s| s.pid as f64),
+        expand: false,
+    },
+    Column {
+        title: "User",
+        render: |s| s.user_name.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Database",
+        render: |s| s.database.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Application",
+        render: |s| s.application_name.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Client",
+        render: |s| s.client_addr.clone().unwrap_or_else(|| "local".to_string()),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "State",
+        render: |s| s.state.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Wait",
+        render: |s| match (&s.wait_event_type, &s.wait_event) {
             (Some(kind), Some(event)) => format!("{kind}: {event}"),
             _ => String::new(),
         },
-        None,
-    ),
-    (
-        "Duration",
-        |s| match s.query_duration_secs {
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Duration",
+        render: |s| match s.query_duration_secs {
             Some(secs) if secs >= 1.0 => format!("{secs:.0}s"),
             Some(secs) => format!("{:.0}ms", secs * 1000.0),
             None => String::new(),
         },
         // A session with no running query has no duration; sort it as zero so
         // idle backends group at the short end rather than sorting by text.
-        Some(|s| s.query_duration_secs.unwrap_or(0.0)),
-    ),
-    (
-        "Query",
-        |s| {
+        sort_key: Some(|s| s.query_duration_secs.unwrap_or(0.0)),
+        expand: false,
+    },
+    Column {
+        title: "Query",
+        render: |s| {
             s.query
                 .clone()
                 .unwrap_or_default()
@@ -119,25 +95,10 @@ const COLUMNS: &[(&str, Renderer, Option<NumericKey>)] = &[
                 .collect::<Vec<_>>()
                 .join(" ")
         },
-        None,
-    ),
+        sort_key: None,
+        expand: true,
+    },
 ];
-
-/// Orders two sessions for a column. Numeric columns compare by their numeric
-/// key; the rest compare lexically on the rendered text. Split out as a pure
-/// function so the numeric-versus-lexical behaviour can be unit-tested without
-/// a GTK widget in the loop.
-fn compare_sessions(
-    a: &Session,
-    b: &Session,
-    render: Renderer,
-    numeric_key: Option<NumericKey>,
-) -> Ordering {
-    match numeric_key {
-        Some(key) => key(a).partial_cmp(&key(b)).unwrap_or(Ordering::Equal),
-        None => render(a).cmp(&render(b)),
-    }
-}
 
 mod imp {
     use super::*;
@@ -154,8 +115,7 @@ mod imp {
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
 
-        pub store: RefCell<Option<gio::ListStore>>,
-        pub filter: RefCell<Option<gtk::CustomFilter>>,
+        pub table: RefCell<Option<Table<Session>>>,
         pub hide_idle: Cell<bool>,
         pub filter_text: RefCell<String>,
     }
@@ -179,8 +139,12 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             self.hide_idle.set(true);
-            self.obj().build_model();
-            self.obj().build_columns();
+
+            let page = self.obj().clone();
+            let table = Table::attach(&self.column_view.get(), COLUMNS, move |session| {
+                page.matches(session)
+            });
+            self.table.replace(Some(table));
 
             let page = self.obj().clone();
             self.filter_entry.connect_search_changed(move |entry| {
@@ -213,89 +177,6 @@ impl McpgSessionsPage {
         glib::Object::new()
     }
 
-    fn build_model(&self) {
-        let imp = self.imp();
-        let store = gio::ListStore::new::<SessionObject>();
-
-        let page = self.clone();
-        let filter = gtk::CustomFilter::new(move |object| {
-            let session = object
-                .downcast_ref::<SessionObject>()
-                .expect("the model only holds SessionObject")
-                .session();
-            page.matches(&session)
-        });
-
-        let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
-        // Incremental filtering plus rapid items-changed is the combination
-        // implicated in the upstream GTK sort/filter crash; keep it off.
-        filtered.set_incremental(false);
-
-        let sorted = gtk::SortListModel::new(Some(filtered), self.imp().column_view.sorter());
-        sorted.set_incremental(false);
-
-        imp.column_view
-            .set_model(Some(&gtk::NoSelection::new(Some(sorted))));
-        imp.store.replace(Some(store));
-        imp.filter.replace(Some(filter));
-    }
-
-    fn build_columns(&self) {
-        let imp = self.imp();
-        for (title, render, numeric_key) in COLUMNS {
-            let render = *render;
-            let numeric_key = *numeric_key;
-            let factory = gtk::SignalListItemFactory::new();
-
-            factory.connect_setup(|_, item| {
-                let label = gtk::Label::new(None);
-                label.set_xalign(0.0);
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                item.downcast_ref::<gtk::ListItem>()
-                    .expect("a ListItem")
-                    .set_child(Some(&label));
-            });
-
-            factory.connect_bind(move |_, item| {
-                let item = item.downcast_ref::<gtk::ListItem>().expect("a ListItem");
-                let label = item
-                    .child()
-                    .and_downcast::<gtk::Label>()
-                    .expect("the child set in setup");
-                let session = item
-                    .item()
-                    .and_downcast::<SessionObject>()
-                    .expect("a SessionObject")
-                    .session();
-                let text = render(&session);
-                label.set_tooltip_text(Some(&text));
-                label.set_text(&text);
-            });
-
-            // Give the column a sorter so clicking its header sorts the table.
-            // The `SortListModel` built in `build_model` already watches
-            // `column_view.sorter()`, which tracks whichever column's sorter is
-            // active.
-            let sorter = gtk::CustomSorter::new(move |a, b| {
-                let session_a = a
-                    .downcast_ref::<SessionObject>()
-                    .expect("the model only holds SessionObject")
-                    .session();
-                let session_b = b
-                    .downcast_ref::<SessionObject>()
-                    .expect("the model only holds SessionObject")
-                    .session();
-                compare_sessions(&session_a, &session_b, render, numeric_key).into()
-            });
-
-            let column = gtk::ColumnViewColumn::new(Some(title), Some(factory));
-            column.set_resizable(true);
-            column.set_expand(*title == "Query");
-            column.set_sorter(Some(&sorter));
-            imp.column_view.append_column(&column);
-        }
-    }
-
     fn matches(&self, session: &Session) -> bool {
         let imp = self.imp();
 
@@ -321,8 +202,8 @@ impl McpgSessionsPage {
     }
 
     fn refilter(&self) {
-        if let Some(filter) = self.imp().filter.borrow().as_ref() {
-            filter.changed(gtk::FilterChange::Different);
+        if let Some(table) = self.imp().table.borrow().as_ref() {
+            table.refilter();
         }
     }
 
@@ -335,15 +216,9 @@ impl McpgSessionsPage {
     }
 
     pub fn update(&self, sessions: &[Session]) {
-        let imp = self.imp();
-        let Some(store) = imp.store.borrow().clone() else {
-            return;
-        };
-        // Replacing the contents in one splice keeps items-changed to a single
-        // emission per sample rather than one per row.
-        let objects: Vec<SessionObject> =
-            sessions.iter().cloned().map(SessionObject::new).collect();
-        store.splice(0, store.n_items(), &objects);
+        if let Some(table) = self.imp().table.borrow().as_ref() {
+            table.update(sessions);
+        }
     }
 }
 
@@ -356,6 +231,8 @@ impl Default for McpgSessionsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::compare_rows;
+    use std::cmp::Ordering;
 
     fn session_with_pid(pid: i32) -> Session {
         Session {
@@ -375,45 +252,56 @@ mod tests {
 
     #[test]
     fn pid_sorts_numerically_not_lexically() {
-        let (title, render, numeric_key) = COLUMNS[0];
-        assert_eq!(title, "PID");
+        let column = &COLUMNS[0];
+        assert_eq!(column.title, "PID");
 
         let nine = session_with_pid(9);
         let ten = session_with_pid(10);
 
-        // Numerically 9 < 10, so the comparator must order nine before ten.
         assert_eq!(
-            compare_sessions(&nine, &ten, render, numeric_key),
+            compare_rows(&nine, &ten, column.render, column.sort_key),
             Ordering::Less
         );
-        // Guard against a regression to lexical sorting: as text, "10" < "9",
-        // which is the wrong order this numeric key exists to prevent.
-        assert_eq!(render(&ten).cmp(&render(&nine)), Ordering::Less);
+        // Guard against a regression to lexical sorting: as text, "10" < "9".
+        assert_eq!(
+            (column.render)(&ten).cmp(&(column.render)(&nine)),
+            Ordering::Less
+        );
     }
 
     #[test]
     fn duration_sorts_numerically_by_seconds() {
+        let column = COLUMNS
+            .iter()
+            .find(|c| c.title == "Duration")
+            .expect("the Duration column exists");
+
         let mut short = session_with_pid(1);
         let mut long = session_with_pid(2);
         short.query_duration_secs = Some(2.0);
         long.query_duration_secs = Some(10.0);
 
-        let numeric_key: Option<NumericKey> = Some(|s| s.query_duration_secs.unwrap_or(0.0));
-        let render: Renderer = |_| String::new();
         assert_eq!(
-            compare_sessions(&short, &long, render, numeric_key),
+            compare_rows(&short, &long, column.render, column.sort_key),
             Ordering::Less
         );
     }
 
     #[test]
     fn text_columns_sort_lexically() {
+        let column = COLUMNS
+            .iter()
+            .find(|c| c.title == "User")
+            .expect("the User column exists");
+
         let mut alice = session_with_pid(1);
         let mut bob = session_with_pid(2);
         alice.user_name = Some("alice".to_string());
         bob.user_name = Some("bob".to_string());
 
-        let render: Renderer = |s| s.user_name.clone().unwrap_or_default();
-        assert_eq!(compare_sessions(&alice, &bob, render, None), Ordering::Less);
+        assert_eq!(
+            compare_rows(&alice, &bob, column.render, column.sort_key),
+            Ordering::Less
+        );
     }
 }

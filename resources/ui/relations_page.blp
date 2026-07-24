@@ -1,0 +1,95 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgRelationsPage: Gtk.Box {
+  orientation: vertical;
+
+  Adw.Banner error_banner {
+    revealed: false;
+  }
+
+  Gtk.Box {
+    halign: center;
+    margin-top: 12;
+
+    Adw.ViewSwitcher {
+      stack: inner_stack;
+      policy: wide;
+    }
+  }
+
+  Gtk.Label database_note {
+    margin-top: 6;
+    xalign: 0.5;
+    styles ["dim-label", "caption"]
+  }
+
+  Adw.ViewStack inner_stack {
+    vexpand: true;
+
+    Adw.ViewStackPage {
+      name: "tables";
+      title: _("Tables");
+      icon-name: "view-grid-symbolic";
+
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.SearchEntry tables_filter {
+          hexpand: true;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 12;
+          margin-bottom: 6;
+          placeholder-text: _("Filter by schema or table name");
+        }
+
+        Gtk.ScrolledWindow {
+          vexpand: true;
+
+          child: Gtk.ColumnView tables_view {
+            show-column-separators: true;
+            reorderable: false;
+          };
+        }
+      };
+    }
+
+    Adw.ViewStackPage {
+      name: "indexes";
+      title: _("Indexes");
+      icon-name: "view-list-symbolic";
+
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.Box {
+          spacing: 12;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 12;
+          margin-bottom: 6;
+
+          Gtk.SearchEntry indexes_filter {
+            hexpand: true;
+            placeholder-text: _("Filter by schema, table or index name");
+          }
+
+          Gtk.ToggleButton unused_only_toggle {
+            label: _("Unused only");
+            tooltip-text: _("Show only indexes with no scans that back no constraint");
+          }
+        }
+
+        Gtk.ScrolledWindow {
+          vexpand: true;
+
+          child: Gtk.ColumnView indexes_view {
+            show-column-separators: true;
+            reorderable: false;
+          };
+        }
+      };
+    }
+  }
+}
