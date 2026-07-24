@@ -145,10 +145,21 @@ pub struct CollectorConfig {
     pub relations_limit: i64,
 }
 
-/// True when this tick should also run the slow tier: always for the first
-/// sample of a connection, so the heavy pages populate immediately, then
-/// once `slow_interval` has elapsed.
-pub fn is_slow_tick(last_slow: Option<Instant>, now: Instant, slow_interval: Duration) -> bool {
+/// True when this tick should also run the slow tier.
+///
+/// Never on a connection's first sample: sampling is serial, so waiting for
+/// the three heavy queries there would leave the Overview blank until they
+/// returned. The slow tier fires on the next tick instead — about one fast
+/// interval later — then once every `slow_interval` after that.
+pub fn is_slow_tick(
+    last_slow: Option<Instant>,
+    now: Instant,
+    slow_interval: Duration,
+    is_first_sample: bool,
+) -> bool {
+    if is_first_sample {
+        return false;
+    }
     match last_slow {
         None => true,
         Some(previous) => now.duration_since(previous) >= slow_interval,
@@ -170,6 +181,13 @@ fn classify_slow<T>(
             _ => Ok(Err(error)),
         },
     }
+}
+
+/// True when this snapshot carries slow-tier results, successful or failed.
+/// A failed slow tier still counts: retrying a broken view every two seconds
+/// would turn one degraded page into a load problem.
+fn slow_tier_ran(snapshot: &Snapshot) -> bool {
+    snapshot.statements.is_some() || snapshot.relations.is_some()
 }
 
 pub fn spawn(
@@ -369,21 +387,27 @@ async fn sample_loop(
     let mut last_slow: Option<Instant> = None;
     let mut consecutive_failures = 0u32;
     let mut had_success = false;
+    let mut is_first_sample = true;
 
     loop {
         if stop_requested(stop) {
             return Exit::Stopped;
         }
 
-        let slow =
-            is_slow_tick(last_slow, Instant::now(), config.slow_interval).then_some(SlowTier {
-                statements_available,
-                statements_limit: config.statements_limit,
-                relations_limit: config.relations_limit,
-                previous_statements: previous_statements
-                    .as_ref()
-                    .map(|(counters, at)| (counters, *at)),
-            });
+        let slow = is_slow_tick(
+            last_slow,
+            Instant::now(),
+            config.slow_interval,
+            is_first_sample,
+        )
+        .then_some(SlowTier {
+            statements_available,
+            statements_limit: config.statements_limit,
+            relations_limit: config.relations_limit,
+            previous_statements: previous_statements
+                .as_ref()
+                .map(|(counters, at)| (counters, *at)),
+        });
 
         match sample(client, previous, slow).await {
             Ok(snapshot) => {
@@ -394,10 +418,7 @@ async fn sample_loop(
                     previous_statements =
                         Some((counters_by_key(&sample.statements), snapshot.taken_at));
                 }
-                // Mark the slow tier as run whether or not its queries
-                // succeeded: retrying a failing view every two seconds would
-                // turn one broken page into a load problem.
-                if snapshot.statements.is_some() || snapshot.relations.is_some() {
+                if slow_tier_ran(&snapshot) {
                     last_slow = Some(snapshot.taken_at);
                 }
                 emit_sample(events, Box::new(snapshot));
@@ -412,6 +433,7 @@ async fn sample_loop(
                 }
             }
         }
+        is_first_sample = false;
 
         tokio::select! {
             _ = tokio::time::sleep(config.interval) => {}
@@ -548,6 +570,7 @@ fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::snapshot::SessionCounts;
 
     #[test]
     fn backoff_doubles_and_then_caps_at_thirty_seconds() {
@@ -603,25 +626,43 @@ mod tests {
     }
 
     #[test]
-    fn the_first_sample_of_a_connection_always_runs_the_slow_tier() {
-        // Otherwise both heavy pages sit blank for the whole slow interval
-        // after connecting.
+    fn the_first_sample_of_a_connection_runs_the_fast_tier_only() {
+        // Sampling is serial, so waiting for the slow tier here would leave
+        // the Overview blank until the three heavy queries returned.
         let now = Instant::now();
-        assert!(is_slow_tick(None, now, Duration::from_secs(10)));
+        assert!(!is_slow_tick(None, now, Duration::from_secs(10), true));
+    }
+
+    #[test]
+    fn the_slow_tier_fires_on_the_tick_after_the_first_sample() {
+        // The heavy pages still populate promptly — about one fast interval
+        // after connecting — rather than waiting a full slow interval.
+        let now = Instant::now();
+        assert!(is_slow_tick(None, now, Duration::from_secs(10), false));
     }
 
     #[test]
     fn the_slow_tier_waits_for_its_interval() {
         let now = Instant::now();
         let recent = now - Duration::from_secs(3);
-        assert!(!is_slow_tick(Some(recent), now, Duration::from_secs(10)));
+        assert!(!is_slow_tick(
+            Some(recent),
+            now,
+            Duration::from_secs(10),
+            false
+        ));
     }
 
     #[test]
     fn the_slow_tier_runs_once_the_interval_has_elapsed() {
         let now = Instant::now();
         let stale = now - Duration::from_secs(11);
-        assert!(is_slow_tick(Some(stale), now, Duration::from_secs(10)));
+        assert!(is_slow_tick(
+            Some(stale),
+            now,
+            Duration::from_secs(10),
+            false
+        ));
     }
 
     #[test]
@@ -648,5 +689,76 @@ mod tests {
             classify_slow(Err::<(), _>(CollectorError::LostConnection)),
             Err(CollectorError::LostConnection)
         ));
+    }
+
+    /// A `Snapshot` with valid but arbitrary Phase 1 fields, so tests of the
+    /// slow-tier fields don't need to care about the rest of the struct.
+    fn test_snapshot(
+        statements: Option<Result<StatementsSample, CollectorError>>,
+        relations: Option<Result<RelationsSample, CollectorError>>,
+    ) -> Snapshot {
+        Snapshot {
+            taken_at: Instant::now(),
+            totals: DatabaseCounters::default(),
+            rates: None,
+            connected_database_size_bytes: None,
+            session_counts: SessionCounts {
+                active: 0,
+                idle: 0,
+                idle_in_transaction: 0,
+                other: 0,
+            },
+            sessions: Vec::new(),
+            settings: ServerSettings {
+                max_connections: 100,
+            },
+            statements,
+            relations,
+        }
+    }
+
+    #[test]
+    fn slow_tier_ran_is_false_when_neither_field_was_sampled() {
+        assert!(!slow_tier_ran(&test_snapshot(None, None)));
+    }
+
+    #[test]
+    fn slow_tier_ran_is_true_when_both_fields_succeeded() {
+        let snapshot = test_snapshot(
+            Some(Ok(StatementsSample {
+                statements: Vec::new(),
+            })),
+            Some(Ok(RelationsSample {
+                tables: Vec::new(),
+                indexes: Vec::new(),
+            })),
+        );
+        assert!(slow_tier_ran(&snapshot));
+    }
+
+    #[test]
+    fn slow_tier_ran_is_true_when_the_extension_is_absent_but_relations_still_sampled() {
+        // pg_stat_statements missing leaves `statements` at `None`, but the
+        // slow tier still ran because table and index stats were sampled.
+        let snapshot = test_snapshot(
+            None,
+            Some(Err(CollectorError::Query(
+                "relation dropped mid-sample".to_string(),
+            ))),
+        );
+        assert!(slow_tier_ran(&snapshot));
+    }
+
+    #[test]
+    fn slow_tier_ran_is_true_when_both_fields_failed() {
+        let snapshot = test_snapshot(
+            Some(Err(CollectorError::Query(
+                "permission denied for view pg_stat_statements".to_string(),
+            ))),
+            Some(Err(CollectorError::Query(
+                "permission denied for relation pg_stat_user_tables".to_string(),
+            ))),
+        );
+        assert!(slow_tier_ran(&snapshot));
     }
 }
