@@ -19,6 +19,7 @@
  */
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -153,6 +154,16 @@ fn is_current(event_generation: u64, current_generation: u64) -> bool {
     event_generation == current_generation
 }
 
+/// The local history database, under the XDG data directory. Created on first
+/// write by the collector; the directory is created here if absent.
+fn history_db_path() -> PathBuf {
+    let base = glib::user_data_dir().join("mission-centre-pg");
+    // A failure to create the directory is non-fatal: the collector opens the
+    // file lazily and logs and disables history if that fails.
+    let _ = std::fs::create_dir_all(&base);
+    base.join("history.db")
+}
+
 impl MissionCentrePgWindow {
     pub fn new(app: &impl IsA<gtk::Application>) -> Self {
         glib::Object::builder().property("application", app).build()
@@ -255,6 +266,7 @@ impl MissionCentrePgWindow {
         if let Some(row) = self.selected_row() {
             row.reset_series();
         }
+        imp.overview_page.reset();
 
         // Clear the queries page too: its rows belong to the server just
         // left, and the slow tier will not refresh them for up to one slow
@@ -290,15 +302,15 @@ impl MissionCentrePgWindow {
             ),
             statements_limit: settings.int("statements-limit").max(10) as i64,
             relations_limit: settings.int("relations-limit").max(10) as i64,
-            // History configuration is wired to GSettings in a later task;
-            // for now the collector reads inert defaults with history off.
-            history_mode: mission_centre_pg::connection::params::HistoryMode::Off,
-            history_interval: std::time::Duration::from_secs(60),
-            history_retention_days: 7,
-            history_top_queries: 50,
-            server_id: String::new(),
-            local_db_path: std::env::temp_dir().join("mission-centre-pg-history.db"),
-            preload_points: 300,
+            history_mode: params.history,
+            history_interval: std::time::Duration::from_millis(
+                settings.int("history-interval-ms").max(10000) as u64,
+            ),
+            history_retention_days: settings.int("history-retention-days").max(1) as i64,
+            history_top_queries: settings.int("history-top-queries").max(0) as usize,
+            server_id: params.id.to_string(),
+            local_db_path: history_db_path(),
+            preload_points: settings.int("graph-points").max(1) as usize,
         };
 
         // Every event this collector ever emits is stamped with this
@@ -421,10 +433,8 @@ impl MissionCentrePgWindow {
                     row.set_state(ConnectionState::Disconnected);
                 }
             }
-            CollectorEvent::History(_preload) => {
-                // A later task feeds the preload into the Overview graph
-                // buffers; for now the collector emits it and the window
-                // accepts it without acting on it.
+            CollectorEvent::History(preload) => {
+                imp.overview_page.preload(&preload.system);
             }
         }
     }

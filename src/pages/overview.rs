@@ -207,10 +207,61 @@ impl McpgOverviewPage {
                 "—".to_string()
             });
     }
+
+    /// Drop all four graph series. Called on a server switch before the new
+    /// server's preload arrives, so one server's shape never bleeds into the
+    /// next.
+    pub fn reset(&self) {
+        for graph in self.graphs() {
+            graph.clear_datasets();
+            graph.add_dataset(DatasetGroup::new());
+        }
+    }
+
+    /// Fill the graph buffers from stored history so they open already drawn.
+    /// Only the connections and cache-hit graphs are preloaded: the persisted
+    /// schema (pg-console's) stores neither TPS nor tuple rates, so those two
+    /// graphs build up live. Samples arrive oldest-first.
+    pub fn preload(&self, samples: &[crate::history::SystemHistorySample]) {
+        let imp = self.imp();
+        if let Some(last) = samples.last() {
+            imp.connections_graph
+                .set_dataset_max_scale(0, last.max_connections as f32);
+        }
+        for sample in samples {
+            imp.connections_graph
+                .add_data_point(vec![vec![sample.total_connections as f32]]);
+            if let Some(ratio) = sample.cache_hit_ratio {
+                if ratio.is_finite() {
+                    imp.cache_graph
+                        .add_data_point(vec![vec![(ratio * 100.0) as f32]]);
+                }
+            }
+        }
+    }
 }
 
 impl Default for McpgOverviewPage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preload_and_reset_are_public_no_op_safe_signatures() {
+        // Constructing the widget needs a GTK main context, which unit tests
+        // do not have. This test exists to keep the method signatures honest
+        // against the window's calls; behaviour is verified by running the app.
+        fn _assert_signatures(
+            page: &McpgOverviewPage,
+            samples: &[crate::history::SystemHistorySample],
+        ) {
+            page.reset();
+            page.preload(samples);
+        }
     }
 }
