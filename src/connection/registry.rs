@@ -57,6 +57,7 @@ pub fn save(settings: &gio::Settings, servers: &[ConnectionParams]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::params::HistoryMode;
     use crate::connection::params::SslMode;
     use uuid::Uuid;
 
@@ -69,6 +70,7 @@ mod tests {
             database: "postgres".to_string(),
             user: "paul".to_string(),
             ssl_mode: SslMode::Prefer,
+            history: HistoryMode::Off,
         }
     }
 

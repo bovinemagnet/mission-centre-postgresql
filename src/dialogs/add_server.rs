@@ -26,7 +26,7 @@ use gtk::glib;
 use uuid::Uuid;
 
 use crate::connection::credentials;
-use crate::connection::params::{ConnectionParams, SslMode};
+use crate::connection::params::{ConnectionParams, HistoryMode, SslMode};
 use crate::i18n::i18n;
 
 type AddedCallback = Box<dyn Fn(&ConnectionParams)>;
@@ -51,6 +51,8 @@ mod imp {
         pub password_row: TemplateChild<adw::PasswordEntryRow>,
         #[template_child]
         pub ssl_row: TemplateChild<adw::ComboRow>,
+        #[template_child]
+        pub history_row: TemplateChild<adw::ComboRow>,
         #[template_child]
         pub add_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -154,6 +156,11 @@ impl McpgAddServerDialog {
                 0 => SslMode::Disable,
                 2 => SslMode::Require,
                 _ => SslMode::Prefer,
+            },
+            history: match imp.history_row.selected() {
+                1 => HistoryMode::Local,
+                2 => HistoryMode::PgConsole,
+                _ => HistoryMode::Off,
             },
         };
 

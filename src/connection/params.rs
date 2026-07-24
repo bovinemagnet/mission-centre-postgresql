@@ -41,6 +41,19 @@ impl SslMode {
     }
 }
 
+/// Where a server's history is stored. Off by default and strictly opt-in:
+/// Local writes to a SQLite file Mission Centre owns; PgConsole writes to an
+/// existing pgconsole schema on the monitored server (INSERT only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryMode {
+    #[default]
+    Off,
+    Local,
+    #[serde(rename = "pgconsole")]
+    PgConsole,
+}
+
 /// Everything needed to reach a server *except* the password, which lives in
 /// the system secret store. This type is serialised into GSettings, so it must
 /// never gain a password field.
@@ -53,6 +66,8 @@ pub struct ConnectionParams {
     pub database: String,
     pub user: String,
     pub ssl_mode: SslMode,
+    #[serde(default)]
+    pub history: HistoryMode,
 }
 
 /// Manual Debug implementation to prevent accidentally including any future
@@ -70,6 +85,7 @@ impl fmt::Debug for ConnectionParams {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("ssl_mode", &self.ssl_mode)
+            .field("history", &self.history)
             .finish()
     }
 }
@@ -107,6 +123,7 @@ mod tests {
             database: "appdb".to_string(),
             user: "monitor".to_string(),
             ssl_mode: SslMode::Require,
+            history: HistoryMode::Off,
         }
     }
 
@@ -151,5 +168,33 @@ mod tests {
         assert!(rendered.contains("ConnectionParams"));
         assert!(rendered.contains("prod")); // the label
         assert!(rendered.contains("db.example.com")); // the host
+    }
+
+    #[test]
+    fn history_mode_defaults_to_off_for_a_phase_1_server_json() {
+        // Servers stored before Phase 3 have no "history" field. They must
+        // deserialise with history off, since history is strictly opt-in.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","label":"old",
+            "host":"localhost","port":5432,"database":"postgres","user":"paul",
+            "ssl_mode":"prefer"}"#;
+        let parsed: ConnectionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.history, HistoryMode::Off);
+    }
+
+    #[test]
+    fn history_mode_round_trips_through_json() {
+        let mut original = params();
+        original.history = HistoryMode::PgConsole;
+        let parsed: ConnectionParams =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert_eq!(parsed.history, HistoryMode::PgConsole);
+    }
+
+    #[test]
+    fn pgconsole_serialises_in_lower_case() {
+        let mut server = params();
+        server.history = HistoryMode::PgConsole;
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(json.contains("\"history\":\"pgconsole\""), "{json}");
     }
 }

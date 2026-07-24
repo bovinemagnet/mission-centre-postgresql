@@ -19,6 +19,7 @@
  */
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{error::SqlState, Client, NoTls, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -40,8 +42,12 @@ use crate::collector::statements::{
     apply_deltas, counters_by_key, map_statement, StatementCounters, StatementKey,
     StatementsSample, STATEMENTS_SQL,
 };
-use crate::connection::params::{ConnectionParams, SslMode};
+use crate::connection::params::{ConnectionParams, HistoryMode, SslMode};
 use crate::connection::probe::{map_server_info, ServerInfo, PROBE_SQL};
+use crate::history::{
+    is_history_tick, query_samples_from, system_sample_from, HistoryBackend, HistoryPreload,
+    QueryHistorySample,
+};
 
 /// Guards against a wedged server hanging the sampler for ever.
 const STATEMENT_TIMEOUT: &str = "SET statement_timeout = '5s'";
@@ -68,6 +74,7 @@ pub enum CollectorEvent {
     Sample(Box<Snapshot>),
     Error(CollectorError),
     Disconnected,
+    History(Box<HistoryPreload>),
 }
 
 pub struct CollectorHandle {
@@ -137,12 +144,22 @@ pub fn backoff_delay(consecutive_failures: u32) -> Duration {
 /// How the collector is configured for one connection. A struct rather than
 /// four positional arguments, since three of the four are durations or
 /// limits that would be easy to transpose.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy`: the history fields add a `String` and a `PathBuf`. It is
+/// moved into the collector thread once, so `Clone` is enough.
+#[derive(Debug, Clone)]
 pub struct CollectorConfig {
     pub interval: Duration,
     pub slow_interval: Duration,
     pub statements_limit: i64,
     pub relations_limit: i64,
+    pub history_mode: HistoryMode,
+    pub history_interval: Duration,
+    pub history_retention_days: i64,
+    pub history_top_queries: usize,
+    pub server_id: String,
+    pub local_db_path: PathBuf,
+    pub preload_points: usize,
 }
 
 /// True when this tick should also run the slow tier.
@@ -204,6 +221,23 @@ fn classify_slow<T>(
     }
 }
 
+/// What a failed history write means. A `Query` error is a property of the
+/// store or the role — the schema was dropped, a privilege revoked — so
+/// history disables for the session and the sample still succeeds. A timeout
+/// or lost connection is the connection's problem, but history never fails a
+/// sample on its own account, so that write is simply skipped.
+enum HistoryOutcome {
+    Disable,
+    SkipWrite,
+}
+
+fn classify_history_error(error: CollectorError) -> HistoryOutcome {
+    match error {
+        CollectorError::Timeout | CollectorError::LostConnection => HistoryOutcome::SkipWrite,
+        _ => HistoryOutcome::Disable,
+    }
+}
+
 pub fn spawn(
     params: ConnectionParams,
     password: String,
@@ -237,6 +271,7 @@ async fn run(
     stop: async_channel::Receiver<()>,
 ) {
     let mut consecutive_failures = 0u32;
+    let mut history_preloaded = false;
 
     loop {
         if stop_requested(&stop) {
@@ -261,7 +296,37 @@ async fn run(
                 if !emit(&events, &stop, CollectorEvent::Connected(info)).await {
                     return;
                 }
-                match sample_loop(&client, config, statements_available, &events, &stop).await {
+                // Resolve the effective backend on every connect — a pgconsole
+                // schema might have appeared since the last attempt, and the
+                // write path needs it regardless. The UI preload, though, is
+                // emitted only on this collector's first successful connect:
+                // a reconnect's live graphs already hold data, and replaying
+                // stored history on top of it would evict recent live points
+                // and draw a misleading jump backwards (Phase 1 keeps graph
+                // history across a reconnect deliberately).
+                let (mut history, preload) =
+                    open_history(&client, &config, config.preload_points).await;
+                if !history_preloaded {
+                    if !emit(&events, &stop, CollectorEvent::History(Box::new(preload))).await {
+                        return;
+                    }
+                    history_preloaded = true;
+                }
+                // Prune the local store once per connection.
+                if let HistoryBackend::Local(store) = &history {
+                    let cutoff = retention_cutoff(config.history_retention_days);
+                    let _ = store.prune(cutoff);
+                }
+                match sample_loop(
+                    &client,
+                    &config,
+                    &mut history,
+                    statements_available,
+                    &events,
+                    &stop,
+                )
+                .await
+                {
                     Exit::Stopped => {
                         // We are already shutting down, so route this
                         // through the non-blocking path rather than emit(),
@@ -391,7 +456,8 @@ fn install_crypto_provider() {
 /// piling overlapping queries onto one connection.
 async fn sample_loop(
     client: &Client,
-    config: CollectorConfig,
+    config: &CollectorConfig,
+    history: &mut HistoryBackend,
     statements_available: bool,
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
@@ -399,6 +465,12 @@ async fn sample_loop(
     let mut previous: Option<(DatabaseCounters, Instant)> = None;
     let mut previous_statements: Option<(HashMap<StatementKey, StatementCounters>, Instant)> = None;
     let mut last_slow: Option<Instant> = None;
+    // History writes run on a coarser clock than the sample loop, and reuse the
+    // query rows from the most recent successful slow sample: the history
+    // interval (60s) is far wider than the slow interval (10s), so most history
+    // ticks have no fresh statements of their own.
+    let mut last_history: Option<Instant> = None;
+    let mut latest_queries: Vec<QueryHistorySample> = Vec::new();
     let mut consecutive_failures = 0u32;
     let mut had_success = false;
     let mut is_first_sample = true;
@@ -429,7 +501,43 @@ async fn sample_loop(
                 if let Some(Ok(sample)) = snapshot.statements.as_ref() {
                     previous_statements =
                         Some((counters_by_key(&sample.statements), snapshot.taken_at));
+                    latest_queries =
+                        query_samples_from(&sample.statements, config.history_top_queries);
                 }
+
+                // History follows its own, coarser cadence inside the serial
+                // loop. `last_history` advances the moment the tick fires —
+                // before the write — so a failed write does not retry-storm
+                // on the next tick, the same lesson as `last_slow`.
+                if !history.is_off()
+                    && is_history_tick(last_history, Instant::now(), config.history_interval)
+                {
+                    last_history = Some(Instant::now());
+                    let system = system_sample_from(&snapshot);
+                    if let Err(e) =
+                        write_history(client, history, config, &system, &latest_queries).await
+                    {
+                        match classify_history_error(e) {
+                            HistoryOutcome::Disable => {
+                                gtk_free_log(
+                                    "history write failed; disabling history for this session",
+                                );
+                                *history = HistoryBackend::Off;
+                            }
+                            HistoryOutcome::SkipWrite => {
+                                // A timeout here is rare, and the next loop
+                                // iteration's sample will surface a genuine
+                                // connection fault anyway. Failing the sample
+                                // from inside the history write would be more
+                                // disruptive than the fault warrants, so log
+                                // and continue: history never fails a sample on
+                                // its own account.
+                                gtk_free_log("history write timed out; skipping this write");
+                            }
+                        }
+                    }
+                }
+
                 emit_sample(events, Box::new(snapshot));
             }
             Err(e) => {
@@ -566,7 +674,7 @@ async fn sample_relations(client: &Client, limit: i64) -> Result<RelationsSample
     Ok(RelationsSample { tables, indexes })
 }
 
-fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
+pub(super) fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
     if e.code() == Some(&SqlState::QUERY_CANCELED) {
         CollectorError::Timeout
     } else if e.is_closed() {
@@ -577,182 +685,5 @@ fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_doubles_and_then_caps_at_thirty_seconds() {
-        assert_eq!(backoff_delay(0), Duration::from_secs(1));
-        assert_eq!(backoff_delay(1), Duration::from_secs(2));
-        assert_eq!(backoff_delay(2), Duration::from_secs(4));
-        assert_eq!(backoff_delay(3), Duration::from_secs(8));
-        assert_eq!(backoff_delay(4), Duration::from_secs(16));
-        assert_eq!(backoff_delay(5), Duration::from_secs(30));
-        assert_eq!(backoff_delay(50), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn errors_render_without_exposing_connection_details() {
-        let error = CollectorError::Connect("password authentication failed".to_string());
-        let rendered = error.to_string();
-        assert!(rendered.contains("password authentication failed"));
-        assert!(!rendered.contains("postgresql://"));
-    }
-
-    #[test]
-    fn stop_requested_is_false_for_an_empty_channel_and_true_for_a_closed_one() {
-        let (tx, rx) = async_channel::bounded::<()>(1);
-        assert!(!stop_requested(&rx));
-        drop(tx);
-        assert!(stop_requested(&rx));
-    }
-
-    #[test]
-    fn stop_requested_is_true_when_a_stop_message_is_pending() {
-        let (tx, rx) = async_channel::bounded::<()>(1);
-        tx.try_send(()).unwrap();
-        assert!(stop_requested(&rx));
-    }
-
-    #[test]
-    fn dropping_the_handle_sends_a_stop_signal_before_closing_the_channel() {
-        // Asserting only `is_closed()` here would pass even with the `Drop`
-        // impl deleted, since dropping the struct also drops the `stop`
-        // sender field on its own. Assert the buffered stop message that
-        // only the `Drop` impl's call to `self.stop()` can have produced.
-        let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
-        let (_event_tx, event_rx) = async_channel::bounded::<CollectorEvent>(1);
-        let handle = CollectorHandle {
-            events: event_rx,
-            stop: stop_tx,
-        };
-
-        drop(handle);
-
-        assert!(matches!(stop_rx.try_recv(), Ok(())));
-        assert!(stop_rx.is_closed());
-    }
-
-    #[test]
-    fn the_first_sample_of_a_connection_runs_the_fast_tier_only() {
-        // Sampling is serial, so waiting for the slow tier here would leave
-        // the Overview blank until the three heavy queries returned.
-        let now = Instant::now();
-        assert!(!is_slow_tick(None, now, Duration::from_secs(10), true));
-    }
-
-    #[test]
-    fn the_slow_tier_fires_on_the_tick_after_the_first_sample() {
-        // The heavy pages still populate promptly — about one fast interval
-        // after connecting — rather than waiting a full slow interval.
-        let now = Instant::now();
-        assert!(is_slow_tick(None, now, Duration::from_secs(10), false));
-    }
-
-    #[test]
-    fn the_slow_tier_waits_for_its_interval() {
-        let now = Instant::now();
-        let recent = now - Duration::from_secs(3);
-        assert!(!is_slow_tick(
-            Some(recent),
-            now,
-            Duration::from_secs(10),
-            false
-        ));
-    }
-
-    #[test]
-    fn the_slow_tier_runs_once_the_interval_has_elapsed() {
-        let now = Instant::now();
-        let stale = now - Duration::from_secs(11);
-        assert!(is_slow_tick(
-            Some(stale),
-            now,
-            Duration::from_secs(10),
-            false
-        ));
-    }
-
-    #[test]
-    fn a_slow_tier_query_error_degrades_one_page_not_the_connection() {
-        // A permission error on pg_stat_statements must not count towards
-        // the three-strike disconnect.
-        let classified = classify_slow(Err::<(), _>(CollectorError::Query(
-            "permission denied for view pg_stat_statements".to_string(),
-        )));
-        assert!(matches!(classified, Ok(Err(CollectorError::Query(_)))));
-    }
-
-    #[test]
-    fn a_slow_tier_timeout_still_fails_the_sample() {
-        assert!(matches!(
-            classify_slow(Err::<(), _>(CollectorError::Timeout)),
-            Err(CollectorError::Timeout)
-        ));
-    }
-
-    #[test]
-    fn a_slow_tier_connection_loss_still_fails_the_sample() {
-        assert!(matches!(
-            classify_slow(Err::<(), _>(CollectorError::LostConnection)),
-            Err(CollectorError::LostConnection)
-        ));
-    }
-
-    #[test]
-    fn an_attempted_slow_tick_advances_last_slow_so_the_next_fast_tick_is_refused() {
-        // Advancing `last_slow` at the moment the tick is attempted — rather
-        // than after the sample returns — is exactly the fix this guards: a
-        // slow-tier timeout produces no snapshot, so if the assignment lived
-        // in the `Ok` arm instead, `last_slow` would stay unset and this
-        // would attempt again on the very next fast tick, two seconds later.
-        let mut last_slow = None;
-        let attempted_at = Instant::now();
-
-        assert!(take_slow_tick(
-            &mut last_slow,
-            attempted_at,
-            Duration::from_secs(10),
-            false
-        ));
-        assert_eq!(last_slow, Some(attempted_at));
-
-        let one_fast_tick_later = attempted_at + Duration::from_secs(2);
-        assert!(!take_slow_tick(
-            &mut last_slow,
-            one_fast_tick_later,
-            Duration::from_secs(10),
-            false
-        ));
-        assert_eq!(last_slow, Some(attempted_at));
-    }
-
-    #[test]
-    fn the_first_sample_neither_attempts_nor_advances_last_slow() {
-        let mut last_slow = None;
-        let now = Instant::now();
-
-        assert!(!take_slow_tick(
-            &mut last_slow,
-            now,
-            Duration::from_secs(10),
-            true
-        ));
-        assert_eq!(last_slow, None);
-    }
-
-    #[test]
-    fn a_tick_inside_the_interval_neither_attempts_nor_advances_last_slow() {
-        let now = Instant::now();
-        let recent = now - Duration::from_secs(3);
-        let mut last_slow = Some(recent);
-
-        assert!(!take_slow_tick(
-            &mut last_slow,
-            now,
-            Duration::from_secs(10),
-            false
-        ));
-        assert_eq!(last_slow, Some(recent));
-    }
-}
+#[path = "worker_tests.rs"]
+mod tests;

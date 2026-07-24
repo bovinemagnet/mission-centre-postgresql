@@ -42,6 +42,24 @@
       <default>200</default>
       <summary>Rows fetched from each relation statistics view per slow sample</summary>
     </key>
+    <key name="history-interval-ms" type="i">
+      <range min="10000" max="600000"/>
+      <default>60000</default>
+      <summary>Minimum gap between history writes in milliseconds</summary>
+      <description>History is written on this coarser clock, independent of the sampling interval, so it does not flood the store.</description>
+    </key>
+    <key name="history-retention-days" type="i">
+      <range min="1" max="365"/>
+      <default>7</default>
+      <summary>Age at which local history rows are pruned</summary>
+      <description>Applies only to the local SQLite store. History in a shared pgconsole schema is never pruned by Mission Centre.</description>
+    </key>
+    <key name="history-top-queries" type="i">
+      <range min="0" max="500"/>
+      <default>50</default>
+      <summary>Statements persisted per history sample</summary>
+      <description>Zero disables query-history persistence while keeping system-metric history.</description>
+    </key>
     <key name="graph-points" type="i">
       <range min="10" max="600"/>
       <default>300</default>

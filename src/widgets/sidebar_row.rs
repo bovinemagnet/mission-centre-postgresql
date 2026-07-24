@@ -18,10 +18,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+use std::cell::RefCell;
+
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 
+use crate::connection::params::HistoryMode;
 use crate::widgets::graph_widget::GraphWidget;
 use crate::widgets::graph_widget_utils::DatasetGroup;
 
@@ -63,6 +66,16 @@ mod imp {
         pub subheading_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub graph: TemplateChild<GraphWidget>,
+        #[template_child]
+        pub history_menu_button: TemplateChild<gtk::MenuButton>,
+
+        /// The stateful "history-mode" action backing the menu's tick marks.
+        /// Stored so `set_history_mode` can update which item is ticked
+        /// without re-fetching the action group off the widget.
+        pub history_action: RefCell<Option<gio::SimpleAction>>,
+        /// Invoked when the user picks a mode from the menu. The window wires
+        /// this to save the choice and restart the collector.
+        pub on_history_change: RefCell<Option<Box<dyn Fn(HistoryMode)>>>,
     }
 
     #[glib::object_subclass]
@@ -90,6 +103,50 @@ mod imp {
             // rather than drawing in the default invisible black.
             self.graph
                 .set_base_color(gdk::RGBA::new(0.30, 0.56, 0.90, 1.0));
+
+            // A GtkListBox row is transient, so the menu is modelled with a
+            // stateful action taking a string parameter rather than one action
+            // per mode. Selecting an item sets the action state (moving the
+            // tick) and emits the chosen mode through `on_history_change`.
+            let menu = gio::Menu::new();
+            menu.append(
+                Some(&crate::i18n::i18n("Off")),
+                Some("row.history-mode::off"),
+            );
+            menu.append(
+                Some(&crate::i18n::i18n("Local")),
+                Some("row.history-mode::local"),
+            );
+            menu.append(
+                Some(&crate::i18n::i18n("pgconsole")),
+                Some("row.history-mode::pgconsole"),
+            );
+            self.history_menu_button.set_menu_model(Some(&menu));
+
+            let group = gio::SimpleActionGroup::new();
+            let action = gio::SimpleAction::new_stateful(
+                "history-mode",
+                Some(glib::VariantTy::STRING),
+                &"off".to_variant(),
+            );
+            let row = self.obj().clone();
+            action.connect_activate(move |action, param| {
+                let Some(value) = param.and_then(|p| p.str().map(str::to_owned)) else {
+                    return;
+                };
+                action.set_state(&value.to_variant());
+                let mode = match value.as_str() {
+                    "local" => HistoryMode::Local,
+                    "pgconsole" => HistoryMode::PgConsole,
+                    _ => HistoryMode::Off,
+                };
+                if let Some(cb) = row.imp().on_history_change.borrow().as_ref() {
+                    cb(mode);
+                }
+            });
+            self.history_action.replace(Some(action.clone()));
+            group.add_action(&action);
+            self.obj().insert_action_group("row", Some(&group));
         }
     }
 
@@ -133,6 +190,26 @@ impl McpgSidebarRow {
         let graph = self.imp().graph.get();
         graph.clear_datasets();
         graph.add_dataset(DatasetGroup::new());
+    }
+
+    /// Tick the menu item matching `mode` without invoking the change
+    /// callback. Called when the row is built to reflect the stored mode.
+    pub fn set_history_mode(&self, mode: HistoryMode) {
+        let value = match mode {
+            HistoryMode::Off => "off",
+            HistoryMode::Local => "local",
+            HistoryMode::PgConsole => "pgconsole",
+        };
+        if let Some(action) = self.imp().history_action.borrow().as_ref() {
+            action.set_state(&value.to_variant());
+        }
+    }
+
+    /// Register the callback invoked when the user picks a mode from the menu.
+    pub fn connect_history_change<F: Fn(HistoryMode) + 'static>(&self, callback: F) {
+        self.imp()
+            .on_history_change
+            .replace(Some(Box::new(callback)));
     }
 }
 

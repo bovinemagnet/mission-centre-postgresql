@@ -38,6 +38,10 @@ use mission_centre_pg::collector::statements::{
 use mission_centre_pg::connection::probe::{
     map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
 };
+use mission_centre_pg::history::pgconsole::{
+    map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
+    PGCONSOLE_PROBE_SQL,
+};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -401,4 +405,140 @@ async fn relations_sql_runs_on_postgres_14() {
 #[tokio::test]
 async fn relations_sql_runs_on_postgres_18() {
     assert_relations_sql_runs("18").await;
+}
+
+const PGCONSOLE_SCHEMA: &str = "\
+CREATE SCHEMA pgconsole;
+CREATE TABLE pgconsole.system_metrics_history (
+    id BIGSERIAL PRIMARY KEY,
+    sampled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    instance_id TEXT NOT NULL DEFAULT 'default',
+    total_connections INTEGER NOT NULL,
+    max_connections INTEGER NOT NULL,
+    active_queries INTEGER NOT NULL,
+    idle_connections INTEGER NOT NULL,
+    idle_in_transaction INTEGER NOT NULL,
+    blocked_queries INTEGER NOT NULL,
+    cache_hit_ratio DOUBLE PRECISION,
+    total_database_size_bytes BIGINT
+);
+CREATE TABLE pgconsole.query_metrics_history (
+    id BIGSERIAL PRIMARY KEY,
+    sampled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    instance_id TEXT NOT NULL DEFAULT 'default',
+    query_id TEXT NOT NULL,
+    query_text TEXT,
+    total_calls BIGINT NOT NULL,
+    total_time_ms DOUBLE PRECISION NOT NULL,
+    total_rows BIGINT NOT NULL,
+    mean_time_ms DOUBLE PRECISION NOT NULL,
+    shared_blks_hit BIGINT,
+    shared_blks_read BIGINT
+);";
+
+async fn assert_pgconsole_probe_and_round_trip(tag: &str) {
+    let (client, container) = connect(tag).await;
+
+    // No schema yet → SchemaMissing.
+    let row = client.query_one(PGCONSOLE_PROBE_SQL, &[]).await.unwrap();
+    assert_eq!(
+        PgConsoleAvailability::classify(row.get("tables_exist"), row.get("can_insert")),
+        PgConsoleAvailability::SchemaMissing
+    );
+
+    // Create pg-console's schema → Writable as the superuser.
+    client.batch_execute(PGCONSOLE_SCHEMA).await.unwrap();
+    let row = client.query_one(PGCONSOLE_PROBE_SQL, &[]).await.unwrap();
+    assert_eq!(
+        PgConsoleAvailability::classify(row.get("tables_exist"), row.get("can_insert")),
+        PgConsoleAvailability::Writable
+    );
+
+    // The system INSERT matches the column types on this version, and reads back.
+    let server_id = "11111111-1111-1111-1111-111111111111";
+    client
+        .execute(
+            INSERT_SYSTEM_SQL,
+            &[
+                &server_id,
+                &47i32,         // total_connections
+                &100i32,        // max_connections
+                &3i32,          // active_queries
+                &40i32,         // idle_connections
+                &4i32,          // idle_in_transaction
+                &Some(0.95f64), // cache_hit_ratio
+                &Some(2048i64), // total_database_size_bytes
+            ],
+        )
+        .await
+        .expect("system INSERT failed");
+
+    let rows = client.query(LOAD_SYSTEM_SQL, &[&10i64]).await.unwrap();
+    let samples: Vec<_> = rows.iter().map(map_system_row).collect();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].total_connections, 47);
+    assert_eq!(samples[0].cache_hit_ratio, Some(0.95));
+    assert_eq!(samples[0].total_database_size_bytes, Some(2048));
+
+    // The query INSERT matches the column types on this version, and reads back.
+    client
+        .execute(
+            INSERT_QUERY_SQL,
+            &[
+                &server_id,
+                &"1234567890", // query_id (pg-console's column is TEXT)
+                &"SELECT 1",   // query_text
+                &10i64,        // total_calls
+                &55.5f64,      // total_time_ms
+                &10i64,        // total_rows
+                &5.55f64,      // mean_time_ms
+                &100i64,       // shared_blks_hit
+                &2i64,         // shared_blks_read
+            ],
+        )
+        .await
+        .expect("query INSERT failed");
+
+    let row = client
+        .query_one(
+            "SELECT query_id, query_text, total_calls, mean_time_ms \
+               FROM pgconsole.query_metrics_history WHERE instance_id = $1",
+            &[&server_id],
+        )
+        .await
+        .unwrap();
+    let query_id: String = row.get("query_id");
+    assert_eq!(query_id, "1234567890");
+    let query_text: Option<String> = row.get("query_text");
+    assert_eq!(query_text.as_deref(), Some("SELECT 1"));
+    let total_calls: i64 = row.get("total_calls");
+    assert_eq!(total_calls, 10);
+    let mean_time_ms: f64 = row.get("mean_time_ms");
+    assert_eq!(mean_time_ms, 5.55);
+
+    // A SELECT-only role sees the schema but cannot INSERT → NotWritable.
+    client
+        .batch_execute(
+            "CREATE ROLE reader LOGIN PASSWORD 'reader';
+             GRANT USAGE ON SCHEMA pgconsole TO reader;
+             GRANT SELECT ON ALL TABLES IN SCHEMA pgconsole TO reader;",
+        )
+        .await
+        .unwrap();
+    let reader = connect_as(&container, "reader", "reader").await;
+    let row = reader.query_one(PGCONSOLE_PROBE_SQL, &[]).await.unwrap();
+    assert_eq!(
+        PgConsoleAvailability::classify(row.get("tables_exist"), row.get("can_insert")),
+        PgConsoleAvailability::NotWritable
+    );
+}
+
+#[tokio::test]
+async fn pgconsole_probe_and_round_trip_on_postgres_14() {
+    assert_pgconsole_probe_and_round_trip("14").await;
+}
+
+#[tokio::test]
+async fn pgconsole_probe_and_round_trip_on_postgres_18() {
+    assert_pgconsole_probe_and_round_trip("18").await;
 }

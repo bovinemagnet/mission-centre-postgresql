@@ -56,6 +56,15 @@ template $McpgAddServerDialog: Adw.Dialog {
             };
             selected: 1;
           }
+
+          Adw.ComboRow history_row {
+            title: _("History");
+            subtitle: _("Where to store metrics for this server");
+            model: Gtk.StringList {
+              strings [_("Off"), _("Local"), _("pgconsole")]
+            };
+            selected: 0;
+          }
         }
       };
     };

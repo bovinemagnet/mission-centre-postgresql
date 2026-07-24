@@ -18,6 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+mod history_io;
 pub mod queries;
 pub mod rates;
 pub mod relations;

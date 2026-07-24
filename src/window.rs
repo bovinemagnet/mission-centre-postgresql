@@ -19,6 +19,7 @@
  */
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -28,7 +29,7 @@ use gtk::{gio, glib};
 use mission_centre_pg::collector::worker::{
     spawn, CollectorConfig, CollectorEvent, CollectorHandle,
 };
-use mission_centre_pg::connection::params::ConnectionParams;
+use mission_centre_pg::connection::params::{ConnectionParams, HistoryMode};
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
@@ -153,6 +154,16 @@ fn is_current(event_generation: u64, current_generation: u64) -> bool {
     event_generation == current_generation
 }
 
+/// The local history database, under the XDG data directory. Created on first
+/// write by the collector; the directory is created here if absent.
+fn history_db_path() -> PathBuf {
+    let base = glib::user_data_dir().join("mission-centre-pg");
+    // A failure to create the directory is non-fatal: the collector opens the
+    // file lazily and logs and disables history if that fails.
+    let _ = std::fs::create_dir_all(&base);
+    base.join("history.db")
+}
+
 impl MissionCentrePgWindow {
     pub fn new(app: &impl IsA<gtk::Application>) -> Self {
         glib::Object::builder().property("application", app).build()
@@ -190,6 +201,12 @@ impl MissionCentrePgWindow {
             let row = McpgSidebarRow::new(&server.label);
             row.set_subheading(&format!("{}:{}", server.host, server.port));
             row.set_state(ConnectionState::Disconnected);
+            row.set_history_mode(server.history);
+            let window = self.clone();
+            let server_id = server.id;
+            row.connect_history_change(move |mode| {
+                window.set_server_history(server_id, mode);
+            });
             imp.server_list.append(&row);
             if Some(server.id) == selected_id {
                 restore_index = Some(i as i32);
@@ -207,6 +224,30 @@ impl MissionCentrePgWindow {
                 imp.restoring_selection.set(true);
                 imp.server_list.select_row(Some(&row));
                 imp.restoring_selection.set(false);
+            }
+        }
+    }
+
+    /// Persist a new history mode for the server with `id` and, if that server
+    /// is the one currently on screen, restart its collector so the new backend
+    /// takes effect immediately.
+    fn set_server_history(&self, id: uuid::Uuid, mode: HistoryMode) {
+        let mut servers = registry::load(&self.settings());
+        let Some(server) = servers.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        server.history = mode;
+        if let Err(e) = registry::save(&self.settings(), &servers) {
+            gtk::glib::g_warning!("mission-centre-pg", "could not save the server list: {e}");
+            return;
+        }
+        self.imp().servers.replace(servers);
+
+        // If this server is the one on screen, restart its collector so the
+        // new backend takes effect immediately.
+        if let Some(index) = self.imp().servers.borrow().iter().position(|s| s.id == id) {
+            if self.imp().server_list.selected_row().map(|r| r.index()) == Some(index as i32) {
+                self.select_server(index as i32);
             }
         }
     }
@@ -255,6 +296,7 @@ impl MissionCentrePgWindow {
         if let Some(row) = self.selected_row() {
             row.reset_series();
         }
+        imp.overview_page.reset();
 
         // Clear the queries page too: its rows belong to the server just
         // left, and the slow tier will not refresh them for up to one slow
@@ -290,6 +332,15 @@ impl MissionCentrePgWindow {
             ),
             statements_limit: settings.int("statements-limit").max(10) as i64,
             relations_limit: settings.int("relations-limit").max(10) as i64,
+            history_mode: params.history,
+            history_interval: std::time::Duration::from_millis(
+                settings.int("history-interval-ms").max(10000) as u64,
+            ),
+            history_retention_days: settings.int("history-retention-days").max(1) as i64,
+            history_top_queries: settings.int("history-top-queries").max(0) as usize,
+            server_id: params.id.to_string(),
+            local_db_path: history_db_path(),
+            preload_points: settings.int("graph-points").max(1) as usize,
         };
 
         // Every event this collector ever emits is stamped with this
@@ -411,6 +462,9 @@ impl MissionCentrePgWindow {
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Disconnected);
                 }
+            }
+            CollectorEvent::History(preload) => {
+                imp.overview_page.preload(&preload.system);
             }
         }
     }
