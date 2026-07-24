@@ -23,4 +23,5 @@ pub mod connection;
 pub mod dialogs;
 pub mod i18n;
 pub mod pages;
+pub mod table;
 pub mod widgets;
