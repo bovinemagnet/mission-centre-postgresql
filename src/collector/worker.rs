@@ -224,16 +224,16 @@ fn classify_slow<T>(
 /// What a failed history write means. A `Query` error is a property of the
 /// store or the role — the schema was dropped, a privilege revoked — so
 /// history disables for the session and the sample still succeeds. A timeout
-/// or lost connection is the connection's problem and fails the sample, as
-/// everywhere else.
+/// or lost connection is the connection's problem, but history never fails a
+/// sample on its own account, so that write is simply skipped.
 enum HistoryOutcome {
     Disable,
-    FailSample,
+    SkipWrite,
 }
 
 fn classify_history_error(error: CollectorError) -> HistoryOutcome {
     match error {
-        CollectorError::Timeout | CollectorError::LostConnection => HistoryOutcome::FailSample,
+        CollectorError::Timeout | CollectorError::LostConnection => HistoryOutcome::SkipWrite,
         _ => HistoryOutcome::Disable,
     }
 }
@@ -271,6 +271,7 @@ async fn run(
     stop: async_channel::Receiver<()>,
 ) {
     let mut consecutive_failures = 0u32;
+    let mut history_preloaded = false;
 
     loop {
         if stop_requested(&stop) {
@@ -295,13 +296,21 @@ async fn run(
                 if !emit(&events, &stop, CollectorEvent::Connected(info)).await {
                     return;
                 }
-                // Resolve the effective backend and hand the UI its preload
-                // before live sampling starts, so the Overview graphs open
-                // with recent history rather than an empty axis.
+                // Resolve the effective backend on every connect — a pgconsole
+                // schema might have appeared since the last attempt, and the
+                // write path needs it regardless. The UI preload, though, is
+                // emitted only on this collector's first successful connect:
+                // a reconnect's live graphs already hold data, and replaying
+                // stored history on top of it would evict recent live points
+                // and draw a misleading jump backwards (Phase 1 keeps graph
+                // history across a reconnect deliberately).
                 let (mut history, preload) =
                     open_history(&client, &config, config.preload_points).await;
-                if !emit(&events, &stop, CollectorEvent::History(Box::new(preload))).await {
-                    return;
+                if !history_preloaded {
+                    if !emit(&events, &stop, CollectorEvent::History(Box::new(preload))).await {
+                        return;
+                    }
+                    history_preloaded = true;
                 }
                 // Prune the local store once per connection.
                 if let HistoryBackend::Local(store) = &history {
@@ -515,7 +524,7 @@ async fn sample_loop(
                                 );
                                 *history = HistoryBackend::Off;
                             }
-                            HistoryOutcome::FailSample => {
+                            HistoryOutcome::SkipWrite => {
                                 // A timeout here is rare, and the next loop
                                 // iteration's sample will surface a genuine
                                 // connection fault anyway. Failing the sample

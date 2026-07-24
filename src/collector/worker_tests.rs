@@ -31,18 +31,18 @@ fn a_pgconsole_write_failure_disables_history_without_failing_the_sample() {
 }
 
 #[test]
-fn a_pgconsole_write_timeout_still_fails_the_sample() {
+fn a_pgconsole_write_timeout_skips_the_write_without_failing_the_sample() {
     assert!(matches!(
         classify_history_error(CollectorError::Timeout),
-        HistoryOutcome::FailSample
+        HistoryOutcome::SkipWrite
     ));
 }
 
 #[test]
-fn a_pgconsole_write_connection_loss_still_fails_the_sample() {
+fn a_pgconsole_write_connection_loss_skips_the_write_without_failing_the_sample() {
     assert!(matches!(
         classify_history_error(CollectorError::LostConnection),
-        HistoryOutcome::FailSample
+        HistoryOutcome::SkipWrite
     ));
 }
 

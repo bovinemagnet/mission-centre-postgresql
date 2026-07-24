@@ -39,7 +39,8 @@ use mission_centre_pg::connection::probe::{
     map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
 };
 use mission_centre_pg::history::pgconsole::{
-    map_system_row, PgConsoleAvailability, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL, PGCONSOLE_PROBE_SQL,
+    map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
+    PGCONSOLE_PROBE_SQL,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
@@ -478,6 +479,42 @@ async fn assert_pgconsole_probe_and_round_trip(tag: &str) {
     assert_eq!(samples[0].total_connections, 47);
     assert_eq!(samples[0].cache_hit_ratio, Some(0.95));
     assert_eq!(samples[0].total_database_size_bytes, Some(2048));
+
+    // The query INSERT matches the column types on this version, and reads back.
+    client
+        .execute(
+            INSERT_QUERY_SQL,
+            &[
+                &server_id,
+                &"1234567890", // query_id (pg-console's column is TEXT)
+                &"SELECT 1",   // query_text
+                &10i64,        // total_calls
+                &55.5f64,      // total_time_ms
+                &10i64,        // total_rows
+                &5.55f64,      // mean_time_ms
+                &100i64,       // shared_blks_hit
+                &2i64,         // shared_blks_read
+            ],
+        )
+        .await
+        .expect("query INSERT failed");
+
+    let row = client
+        .query_one(
+            "SELECT query_id, query_text, total_calls, mean_time_ms \
+               FROM pgconsole.query_metrics_history WHERE instance_id = $1",
+            &[&server_id],
+        )
+        .await
+        .unwrap();
+    let query_id: String = row.get("query_id");
+    assert_eq!(query_id, "1234567890");
+    let query_text: Option<String> = row.get("query_text");
+    assert_eq!(query_text.as_deref(), Some("SELECT 1"));
+    let total_calls: i64 = row.get("total_calls");
+    assert_eq!(total_calls, 10);
+    let mean_time_ms: f64 = row.get("mean_time_ms");
+    assert_eq!(mean_time_ms, 5.55);
 
     // A SELECT-only role sees the schema but cannot INSERT → NotWritable.
     client
