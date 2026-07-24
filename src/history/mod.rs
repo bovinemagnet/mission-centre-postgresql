@@ -1,4 +1,4 @@
-/* lib.rs
+/* history/mod.rs
  *
  * Copyright 2026 Paul Snow
  *
@@ -18,11 +18,4 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-pub mod collector;
-pub mod connection;
-pub mod dialogs;
-pub mod history;
-pub mod i18n;
-pub mod pages;
-pub mod table;
-pub mod widgets;
+pub mod sample;
