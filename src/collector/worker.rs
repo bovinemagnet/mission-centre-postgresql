@@ -21,13 +21,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Once;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use rustls::RootCertStore;
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{error::SqlState, Client, NoTls, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -43,14 +44,9 @@ use crate::collector::statements::{
 };
 use crate::connection::params::{ConnectionParams, HistoryMode, SslMode};
 use crate::connection::probe::{map_server_info, ServerInfo, PROBE_SQL};
-use crate::history::local::LocalStore;
-use crate::history::pgconsole::{
-    map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
-    PGCONSOLE_PROBE_SQL,
-};
 use crate::history::{
     is_history_tick, query_samples_from, system_sample_from, HistoryBackend, HistoryPreload,
-    QueryHistorySample, SystemHistorySample,
+    QueryHistorySample,
 };
 
 /// Guards against a wedged server hanging the sampler for ever.
@@ -669,159 +665,13 @@ async fn sample_relations(client: &Client, limit: i64) -> Result<RelationsSample
     Ok(RelationsSample { tables, indexes })
 }
 
-fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
+pub(super) fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
     if e.code() == Some(&SqlState::QUERY_CANCELED) {
         CollectorError::Timeout
     } else if e.is_closed() {
         CollectorError::LostConnection
     } else {
         CollectorError::Query(e.to_string())
-    }
-}
-
-/// Resolves the effective backend for this connection and loads the recent
-/// history to preload. A pgconsole schema that is missing or unwritable falls
-/// back to Local with a logged note; the connection is never failed for it.
-async fn open_history(
-    client: &Client,
-    config: &CollectorConfig,
-    preload_limit: usize,
-) -> (HistoryBackend, HistoryPreload) {
-    match config.history_mode {
-        HistoryMode::Off => (HistoryBackend::Off, HistoryPreload::default()),
-        HistoryMode::PgConsole => match probe_pgconsole(client).await {
-            PgConsoleAvailability::Writable => {
-                let system = load_pgconsole_history(client, preload_limit).await;
-                (HistoryBackend::PgConsole, HistoryPreload { system })
-            }
-            other => {
-                gtk_free_log(&format!(
-                    "pgconsole history unavailable ({other:?}); using local history"
-                ));
-                open_local(config, preload_limit)
-            }
-        },
-        HistoryMode::Local => open_local(config, preload_limit),
-    }
-}
-
-async fn probe_pgconsole(client: &Client) -> PgConsoleAvailability {
-    match client.query_one(PGCONSOLE_PROBE_SQL, &[]).await {
-        Ok(row) => PgConsoleAvailability::classify(row.get("tables_exist"), row.get("can_insert")),
-        // A probe that itself errors is treated as no usable schema.
-        Err(_) => PgConsoleAvailability::SchemaMissing,
-    }
-}
-
-async fn load_pgconsole_history(client: &Client, limit: usize) -> Vec<SystemHistorySample> {
-    match client.query(LOAD_SYSTEM_SQL, &[&(limit as i64)]).await {
-        Ok(rows) => {
-            let mut samples: Vec<SystemHistorySample> = rows.iter().map(map_system_row).collect();
-            samples.reverse(); // newest-first from SQL → oldest-first
-            samples
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
-fn open_local(config: &CollectorConfig, preload_limit: usize) -> (HistoryBackend, HistoryPreload) {
-    match LocalStore::open(&config.local_db_path) {
-        Ok(store) => {
-            let system = store
-                .load_recent_system(&config.server_id, preload_limit)
-                .unwrap_or_default();
-            (HistoryBackend::Local(store), HistoryPreload { system })
-        }
-        Err(e) => {
-            gtk_free_log(&format!(
-                "local history unavailable ({e}); history disabled"
-            ));
-            (HistoryBackend::Off, HistoryPreload::default())
-        }
-    }
-}
-
-/// A log line from the collector thread. `g_warning!` is GTK-thread-only, so
-/// the collector uses eprintln through the glib logger's stderr, never a GTK
-/// call. Kept in one place so the GTK-free rule is easy to check.
-fn gtk_free_log(message: &str) {
-    eprintln!("mission-centre-pg: {message}");
-}
-
-/// Unix-epoch second before which local history rows are pruned. Uses wall
-/// clock, which is correct for a retention window; the sample loop's Instant
-/// timing is monotonic and unrelated.
-fn retention_cutoff(retention_days: i64) -> i64 {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    now - retention_days * 86_400
-}
-
-/// Writes one system row and the latest query rows to whichever backend is
-/// active. Local writes are synchronous SQLite calls run inline — they are
-/// small and infrequent (default 60s) and the loop is serial, so a brief
-/// block is acceptable and simpler than a blocking-pool hop. pgconsole writes
-/// go over the existing client.
-async fn write_history(
-    client: &Client,
-    history: &HistoryBackend,
-    config: &CollectorConfig,
-    system: &SystemHistorySample,
-    queries: &[QueryHistorySample],
-) -> Result<(), CollectorError> {
-    let sampled_at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    match history {
-        HistoryBackend::Off => Ok(()),
-        HistoryBackend::Local(store) => store
-            .write_system(&config.server_id, sampled_at, system)
-            .and_then(|_| store.write_queries(&config.server_id, sampled_at, queries))
-            .map_err(|e| CollectorError::Query(e.to_string())),
-        HistoryBackend::PgConsole => {
-            client
-                .execute(
-                    INSERT_SYSTEM_SQL,
-                    &[
-                        &config.server_id,
-                        &system.total_connections,
-                        &system.max_connections,
-                        &system.active_queries,
-                        &system.idle_connections,
-                        &system.idle_in_transaction,
-                        &system.cache_hit_ratio,
-                        &system.total_database_size_bytes,
-                    ],
-                )
-                .await
-                .map_err(map_query_error)?;
-            for q in queries {
-                // query_id is NOT NULL in pg-console's schema; skip the
-                // text-hashed utility statements that have no queryid.
-                let Some(id) = q.query_id else { continue };
-                client
-                    .execute(
-                        INSERT_QUERY_SQL,
-                        &[
-                            &config.server_id,
-                            &id.to_string(),
-                            &q.query_text,
-                            &q.total_calls,
-                            &q.total_time_ms,
-                            &q.total_rows,
-                            &q.mean_time_ms,
-                            &q.shared_blks_hit,
-                            &q.shared_blks_read,
-                        ],
-                    )
-                    .await
-                    .map_err(map_query_error)?;
-            }
-            Ok(())
-        }
     }
 }
 
