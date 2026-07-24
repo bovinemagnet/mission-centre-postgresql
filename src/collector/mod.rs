@@ -20,6 +20,7 @@
 
 pub mod queries;
 pub mod rates;
+pub mod relations;
 pub mod snapshot;
 pub mod statements;
 pub mod worker;

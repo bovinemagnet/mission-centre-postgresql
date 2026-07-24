@@ -28,6 +28,9 @@ use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
 };
+use mission_centre_pg::collector::relations::{
+    map_index_stats, map_table_stats, INDEXES_SQL, TABLES_SQL,
+};
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
 use mission_centre_pg::collector::statements::{
     apply_deltas, counters_by_key, map_statement, STATEMENTS_SQL,
@@ -113,6 +116,22 @@ async fn connect_with_statements(
         .await
         .expect("failed to create the extension");
     (client, container)
+}
+
+/// Retries `attempt` until it returns `Some`, or gives up after five seconds.
+/// Used where a PostgreSQL stats view can lag the DML that produced it.
+async fn wait_for<F, Fut, T>(mut attempt: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for _ in 0..25 {
+        if let Some(value) = attempt().await {
+            return Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
 }
 
 async fn assert_all_statements_run(tag: &str) {
@@ -314,4 +333,72 @@ async fn a_delta_is_derived_across_two_statement_samples() {
         second.iter().any(|s| s.delta.is_some()),
         "at least one statement seen in both samples should carry a delta"
     );
+}
+
+async fn assert_relations_sql_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    // pg_stat_user_tables excludes system catalogues, so a stock container
+    // has nothing to report until a user table exists.
+    client
+        .batch_execute(
+            "CREATE TABLE orders (id bigserial PRIMARY KEY, note text);
+             CREATE INDEX orders_note_idx ON orders (note);
+             INSERT INTO orders (note) SELECT 'n' || g FROM generate_series(1, 500) g;
+             DELETE FROM orders WHERE id % 5 = 0;
+             ANALYZE orders;",
+        )
+        .await
+        .expect("failed to create the sample schema");
+
+    // PostgreSQL throttles pgstat_report_stat() to at most once per second
+    // (PGSTAT_MIN_INTERVAL), so pg_stat_user_tables can lag the DML above by
+    // up to that long regardless of server version. Poll rather than assert
+    // immediately, which would race that throttle.
+    let orders = wait_for(|| async {
+        let rows = client
+            .query(TABLES_SQL, &[&200i64])
+            .await
+            .expect("pg_stat_user_tables query failed");
+        rows.iter()
+            .map(map_table_stats)
+            .find(|t| t.table_name == "orders" && t.dead_tuple_ratio().is_some())
+    })
+    .await
+    .expect("the orders table should be reported with a dead-tuple ratio once stats flush");
+    assert!(orders.total_bytes > 0, "the table should have a size");
+
+    let rows = client
+        .query(INDEXES_SQL, &[&200i64])
+        .await
+        .expect("pg_stat_user_indexes query failed");
+    let indexes: Vec<_> = rows.iter().map(map_index_stats).collect();
+    assert!(
+        indexes
+            .iter()
+            .any(|i| i.index_name == "orders_pkey" && i.is_primary),
+        "the primary key should be reported and flagged"
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|i| i.index_name == "orders_note_idx" && i.is_unused()),
+        "the never-queried secondary index should be reported as unused"
+    );
+    assert!(
+        !indexes
+            .iter()
+            .any(|i| i.index_name == "orders_pkey" && i.is_unused()),
+        "an unscanned primary key must never be reported as unused"
+    );
+}
+
+#[tokio::test]
+async fn relations_sql_runs_on_postgres_14() {
+    assert_relations_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn relations_sql_runs_on_postgres_18() {
+    assert_relations_sql_runs("18").await;
 }
