@@ -100,6 +100,10 @@ const COLUMNS: &[Column<Session>] = &[
     },
 ];
 
+fn session_key(session: &Session) -> String {
+    session.pid.to_string()
+}
+
 mod imp {
     use super::*;
 
@@ -141,9 +145,12 @@ mod imp {
             self.hide_idle.set(true);
 
             let page = self.obj().clone();
-            let table = Table::attach(&self.column_view.get(), COLUMNS, move |session| {
-                page.matches(session)
-            });
+            let table = Table::attach(
+                &self.column_view.get(),
+                COLUMNS,
+                move |session| page.matches(session),
+                session_key,
+            );
             self.table.replace(Some(table));
 
             let page = self.obj().clone();

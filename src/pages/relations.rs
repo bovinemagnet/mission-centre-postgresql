@@ -206,6 +206,17 @@ const INDEX_COLUMNS: &[Column<IndexStats>] = &[
     },
 ];
 
+fn table_key(table: &TableStats) -> String {
+    format!("{}.{}", table.schema_name, table.table_name)
+}
+
+fn index_key(index: &IndexStats) -> String {
+    format!(
+        "{}.{}.{}",
+        index.schema_name, index.table_name, index.index_name
+    )
+}
+
 mod imp {
     use super::*;
 
@@ -256,15 +267,21 @@ mod imp {
             self.parent_constructed();
 
             let page = self.obj().clone();
-            let tables = Table::attach(&self.tables_view.get(), TABLE_COLUMNS, move |table| {
-                page.table_matches(table)
-            });
+            let tables = Table::attach(
+                &self.tables_view.get(),
+                TABLE_COLUMNS,
+                move |table| page.table_matches(table),
+                table_key,
+            );
             self.tables.replace(Some(tables));
 
             let page = self.obj().clone();
-            let indexes = Table::attach(&self.indexes_view.get(), INDEX_COLUMNS, move |index| {
-                page.index_matches(index)
-            });
+            let indexes = Table::attach(
+                &self.indexes_view.get(),
+                INDEX_COLUMNS,
+                move |index| page.index_matches(index),
+                index_key,
+            );
             self.indexes.replace(Some(indexes));
 
             let page = self.obj().clone();
