@@ -25,6 +25,7 @@ use adw::subclass::prelude::*;
 use gtk::glib;
 
 use crate::collector::relations::{IndexStats, RelationsSample, TableStats};
+use crate::connection::probe::Capabilities;
 use crate::i18n::{i18n, i18n_f};
 use crate::pages::format::{format_bytes, format_rate, format_ratio};
 use crate::table::{Column, Table};
@@ -239,6 +240,14 @@ mod imp {
         pub unused_only_toggle: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub indexes_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub maintain_reason: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub analyze_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub vacuum_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub vacuum_analyze_button: TemplateChild<gtk::Button>,
 
         pub tables: RefCell<Option<Table<TableStats>>>,
         pub indexes: RefCell<Option<Table<IndexStats>>>,
@@ -360,6 +369,39 @@ impl McpgRelationsPage {
         self.imp().database_note.set_text(&i18n_f(
             "Statistics for the database {} only.",
             &[&database],
+        ));
+    }
+
+    /// The selected table, or `None` when nothing is selected — including
+    /// after a refresh in which the table was dropped.
+    pub fn selected_table(&self) -> Option<TableStats> {
+        self.imp()
+            .tables
+            .borrow()
+            .as_ref()
+            .and_then(|table| table.selected())
+            .map(|row| (*row).clone())
+    }
+
+    pub fn connect_tables_selection_changed(&self, f: impl Fn() + 'static) {
+        if let Some(table) = self.imp().tables.borrow().as_ref() {
+            table.connect_selection_changed(f);
+        }
+    }
+
+    /// Shows why maintenance is unavailable when neither the connection nor
+    /// the selected table grants it. See the note on
+    /// `McpgSessionsPage::set_capabilities` for why this is a label and not
+    /// only a tooltip.
+    pub fn set_capabilities(&self, capabilities: &Capabilities) {
+        let selected_allows = self
+            .selected_table()
+            .map(|table| table.may_maintain(capabilities.maintain))
+            .unwrap_or(false);
+        let imp = self.imp();
+        imp.maintain_reason.set_visible(!selected_allows);
+        imp.maintain_reason.set_text(&i18n(
+            "Maintaining a table requires owning it, or membership of pg_maintain.",
         ));
     }
 

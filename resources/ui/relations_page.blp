@@ -52,6 +52,40 @@ template $McpgRelationsPage: Gtk.Box {
             reorderable: false;
           };
         }
+
+        Gtk.Box {
+          spacing: 6;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 6;
+          margin-bottom: 12;
+
+          Gtk.Label maintain_reason {
+            hexpand: true;
+            xalign: 0;
+            visible: false;
+            wrap: true;
+            styles ["dim-label", "caption"]
+          }
+
+          Gtk.Button analyze_button {
+            label: _("Analyse");
+            tooltip-text: _("Refresh the planner's statistics for the selected table");
+            action-name: "win.analyze-table";
+          }
+
+          Gtk.Button vacuum_button {
+            label: _("Vacuum");
+            tooltip-text: _("Reclaim space from dead tuples in the selected table");
+            action-name: "win.vacuum-table";
+          }
+
+          Gtk.Button vacuum_analyze_button {
+            label: _("Vacuum & analyse");
+            tooltip-text: _("Reclaim space and refresh statistics in one pass");
+            action-name: "win.vacuum-analyze-table";
+          }
+        }
       };
     }
 
