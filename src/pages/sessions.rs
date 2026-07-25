@@ -25,6 +25,8 @@ use adw::subclass::prelude::*;
 use gtk::glib;
 
 use crate::collector::snapshot::Session;
+use crate::connection::probe::Capabilities;
+use crate::i18n::i18n;
 use crate::table::{Column, Table};
 
 const COLUMNS: &[Column<Session>] = &[
@@ -118,6 +120,12 @@ mod imp {
         pub privilege_note: TemplateChild<adw::Banner>,
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub signal_reason: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub cancel_backend_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub terminate_backend_button: TemplateChild<gtk::Button>,
 
         pub table: RefCell<Option<Table<Session>>>,
         pub hide_idle: Cell<bool>,
@@ -220,6 +228,37 @@ impl McpgSessionsPage {
 
     pub fn set_privilege_limited(&self, limited: bool) {
         self.imp().privilege_note.set_revealed(limited);
+    }
+
+    /// The selected backend, or `None` when nothing is selected — including
+    /// after a refresh in which the selected backend exited.
+    pub fn selected_session(&self) -> Option<Session> {
+        self.imp()
+            .table
+            .borrow()
+            .as_ref()
+            .and_then(|table| table.selected())
+            .map(|row| (*row).clone())
+    }
+
+    pub fn connect_selection_changed(&self, f: impl Fn() + 'static) {
+        if let Some(table) = self.imp().table.borrow().as_ref() {
+            table.connect_selection_changed(f);
+        }
+    }
+
+    /// Shows why the buttons are unavailable when the role cannot signal.
+    ///
+    /// A label rather than only a tooltip: GTK does not deliver tooltips to
+    /// insensitive widgets, so a tooltip alone would be invisible in exactly
+    /// the case it exists for. The tooltip set in the Blueprint still serves
+    /// the sensitive case.
+    pub fn set_capabilities(&self, capabilities: &Capabilities) {
+        let imp = self.imp();
+        imp.signal_reason.set_visible(!capabilities.signal_backend);
+        imp.signal_reason.set_text(&i18n(
+            "Cancelling and terminating backends requires membership of pg_signal_backend.",
+        ));
     }
 
     pub fn update(&self, sessions: &[Session]) {

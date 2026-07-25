@@ -35,4 +35,33 @@ template $McpgSessionsPage: Gtk.Box {
       reorderable: false;
     };
   }
+
+  Gtk.Box {
+    spacing: 6;
+    margin-start: 12;
+    margin-end: 12;
+    margin-top: 6;
+    margin-bottom: 12;
+
+    Gtk.Label signal_reason {
+      hexpand: true;
+      xalign: 0;
+      visible: false;
+      wrap: true;
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button cancel_backend_button {
+      label: _("Cancel query");
+      tooltip-text: _("Ask the selected backend to abandon its current query");
+      action-name: "win.cancel-backend";
+    }
+
+    Gtk.Button terminate_backend_button {
+      label: _("Terminate");
+      tooltip-text: _("Close the selected backend's connection");
+      action-name: "win.terminate-backend";
+      styles ["destructive-action"]
+    }
+  }
 }
