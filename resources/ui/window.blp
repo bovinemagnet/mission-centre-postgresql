@@ -6,7 +6,8 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
   default-width: 1100;
   default-height: 700;
 
-  content: Adw.NavigationSplitView split_view {
+  content: Adw.ToastOverlay toast_overlay {
+    child: Adw.NavigationSplitView split_view {
     sidebar: Adw.NavigationPage {
       title: _("Servers");
 
@@ -39,6 +40,13 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
             stack: view_stack;
             policy: wide;
           };
+
+          [end]
+          Gtk.MenuButton {
+            icon-name: "view-more-symbolic";
+            tooltip-text: _("Server actions");
+            menu-model: server_actions_menu;
+          }
         }
 
         [top]
@@ -82,5 +90,20 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
         };
       };
     };
+    };
   };
+}
+
+menu server_actions_menu {
+  section {
+    item {
+      label: _("Reload configuration");
+      action: "win.reload-configuration";
+    }
+
+    item {
+      label: _("Reset query statistics");
+      action: "win.reset-statements";
+    }
+  }
 }
