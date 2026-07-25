@@ -35,7 +35,7 @@ use crate::collector::queries::{
 };
 use crate::collector::rates::derive_rates;
 use crate::collector::relations::{
-    map_index_stats, map_table_stats, RelationsSample, INDEXES_SQL, TABLES_SQL,
+    map_index_stats, map_table_stats, tables_sql, RelationsSample, INDEXES_SQL,
 };
 use crate::collector::snapshot::{DatabaseCounters, ServerSettings, Snapshot};
 use crate::collector::statements::{
@@ -293,6 +293,7 @@ async fn run(
         match connect_result {
             Ok((client, info)) => {
                 let statements_available = info.statements.is_available();
+                let version_num = info.version_num;
                 if !emit(&events, &stop, CollectorEvent::Connected(info)).await {
                     return;
                 }
@@ -322,6 +323,7 @@ async fn run(
                     &config,
                     &mut history,
                     statements_available,
+                    version_num,
                     &events,
                     &stop,
                 )
@@ -459,6 +461,7 @@ async fn sample_loop(
     config: &CollectorConfig,
     history: &mut HistoryBackend,
     statements_available: bool,
+    version_num: i32,
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
 ) -> Exit {
@@ -487,6 +490,7 @@ async fn sample_loop(
                     statements_available,
                     statements_limit: config.statements_limit,
                     relations_limit: config.relations_limit,
+                    version_num,
                     previous_statements: previous_statements
                         .as_ref()
                         .map(|(counters, at)| (counters, *at)),
@@ -564,6 +568,7 @@ struct SlowTier<'a> {
     statements_available: bool,
     statements_limit: i64,
     relations_limit: i64,
+    version_num: i32,
     previous_statements: Option<(&'a HashMap<StatementKey, StatementCounters>, Instant)>,
 }
 
@@ -617,7 +622,7 @@ async fn sample(
                 None
             };
             let relations = Some(classify_slow(
-                sample_relations(client, slow.relations_limit).await,
+                sample_relations(client, slow.relations_limit, slow.version_num).await,
             )?);
             (statements, relations)
         }
@@ -658,9 +663,13 @@ async fn sample_statements(
     Ok(StatementsSample { statements })
 }
 
-async fn sample_relations(client: &Client, limit: i64) -> Result<RelationsSample, CollectorError> {
+async fn sample_relations(
+    client: &Client,
+    limit: i64,
+    version_num: i32,
+) -> Result<RelationsSample, CollectorError> {
     let rows = client
-        .query(TABLES_SQL, &[&limit])
+        .query(&tables_sql(version_num), &[&limit])
         .await
         .map_err(map_query_error)?;
     let tables = rows.iter().map(map_table_stats).collect();

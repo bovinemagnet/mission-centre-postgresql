@@ -29,7 +29,7 @@ use mission_centre_pg::collector::queries::{
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
 };
 use mission_centre_pg::collector::relations::{
-    map_index_stats, map_table_stats, INDEXES_SQL, TABLES_SQL,
+    map_index_stats, map_table_stats, tables_sql, INDEXES_SQL,
 };
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
 use mission_centre_pg::collector::statements::{
@@ -342,6 +342,13 @@ async fn a_delta_is_derived_across_two_statement_samples() {
 async fn assert_relations_sql_runs(tag: &str) {
     let (client, _container) = connect(tag).await;
 
+    let version_num: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .expect("failed to read the server version")
+        .get(0);
+    let tables_query = tables_sql(version_num);
+
     // pg_stat_user_tables excludes system catalogues, so a stock container
     // has nothing to report until a user table exists.
     client
@@ -361,7 +368,7 @@ async fn assert_relations_sql_runs(tag: &str) {
     // immediately, which would race that throttle.
     let orders = wait_for(|| async {
         let rows = client
-            .query(TABLES_SQL, &[&200i64])
+            .query(&tables_query, &[&200i64])
             .await
             .expect("pg_stat_user_tables query failed");
         rows.iter()
@@ -371,6 +378,10 @@ async fn assert_relations_sql_runs(tag: &str) {
     .await
     .expect("the orders table should be reported with a dead-tuple ratio once stats flush");
     assert!(orders.total_bytes > 0, "the table should have a size");
+    assert!(
+        orders.can_maintain,
+        "postgres owns the table it created and must be able to maintain it"
+    );
 
     let rows = client
         .query(INDEXES_SQL, &[&200i64])

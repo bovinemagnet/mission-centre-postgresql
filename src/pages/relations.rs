@@ -409,6 +409,7 @@ mod tests {
             n_dead_tup: 250,
             secs_since_vacuum: Some(3_600.0),
             total_bytes: 1_048_576,
+            can_maintain: true,
         }
     }
 
