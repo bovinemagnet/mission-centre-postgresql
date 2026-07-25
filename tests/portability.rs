@@ -542,3 +542,56 @@ async fn pgconsole_probe_and_round_trip_on_postgres_14() {
 async fn pgconsole_probe_and_round_trip_on_postgres_18() {
     assert_pgconsole_probe_and_round_trip("18").await;
 }
+
+/// The four capability columns must run on every supported major. The two
+/// guarded expressions are the point: `to_regprocedure` on a server without
+/// pg_stat_statements, and the `pg_roles` subselect on a server without
+/// `pg_maintain` (14 through 16). Either written naively raises, and a raising
+/// probe fails the connection outright.
+async fn assert_capability_probe_runs(tag: &str) {
+    let (client, container) = connect(tag).await;
+
+    let row = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run on a stock server with no extension");
+    let info = map_server_info(&row);
+    assert!(
+        info.capabilities.signal_backend,
+        "postgres is a superuser and must be able to signal"
+    );
+    assert!(info.capabilities.reload_conf);
+    assert!(
+        !info.capabilities.reset_statements,
+        "the extension is absent, so the reset function does not exist"
+    );
+
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the unprivileged role");
+    let plain = connect_as(&container, "plain", "plain").await;
+    let row = plain
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run for an unprivileged role too");
+    let info = map_server_info(&row);
+    assert!(
+        !info.capabilities.signal_backend,
+        "a plain role may not signal other backends"
+    );
+    assert!(
+        !info.capabilities.maintain,
+        "a plain role holds no server-wide maintenance privilege"
+    );
+}
+
+#[tokio::test]
+async fn capability_probe_runs_on_postgres_14() {
+    assert_capability_probe_runs("14").await;
+}
+
+#[tokio::test]
+async fn capability_probe_runs_on_postgres_18() {
+    assert_capability_probe_runs("18").await;
+}

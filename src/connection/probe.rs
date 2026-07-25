@@ -24,12 +24,30 @@ use tokio_postgres::Row;
 /// need a newer server gate themselves. See spec §5.
 pub const MIN_SUPPORTED_VERSION: i32 = 140000;
 
+/// Every capability expression must be written so it cannot raise on a server
+/// that lacks the object it names: this query runs on every connect, and a
+/// probe that fails fails the connection. `to_regprocedure` yields NULL rather
+/// than raising when pg_stat_statements is absent, and the `pg_roles`
+/// subselect returns no row on 14-16, where `pg_maintain` does not exist — a
+/// bare `pg_has_role(current_user, 'pg_maintain', 'member')` would raise there.
+///
+/// Superusers need no special case: `pg_has_role` and `has_function_privilege`
+/// both return true for them.
 pub const PROBE_SQL: &str = "\
 SELECT current_setting('server_version_num')::int AS version_num,
        pg_has_role(current_user, 'pg_monitor', 'member') AS is_monitor,
        COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) AS is_superuser,
        (SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements')
-         AS statements_version";
+         AS statements_version,
+       pg_has_role(current_user, 'pg_signal_backend', 'member') AS can_signal,
+       has_function_privilege(current_user, 'pg_reload_conf()', 'execute') AS can_reload,
+       (SELECT has_function_privilege(current_user, p.oid, 'execute')
+          FROM pg_proc p
+         WHERE p.oid = to_regprocedure('pg_stat_statements_reset()'))
+         AS can_reset_statements,
+       (SELECT pg_has_role(current_user, oid, 'member')
+          FROM pg_roles WHERE rolname = 'pg_maintain')
+         AS can_maintain";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegeLevel {
@@ -102,12 +120,46 @@ fn parse_extension_version(version: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// What the connected role may *do*, as distinct from what it may *see*.
+///
+/// `PrivilegeLevel` answers visibility and drives the window banner; it is the
+/// wrong authority for actions in both directions. `pg_monitor` grants no
+/// right to signal a backend, and a plain role granted `pg_signal_backend`, or
+/// one that merely owns the table it wants to ANALYZE, may act without holding
+/// either level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    pub signal_backend: bool,
+    pub reload_conf: bool,
+    pub reset_statements: bool,
+    pub maintain: bool,
+}
+
+impl Capabilities {
+    /// SQL NULL — an absent extension, an absent `pg_maintain` role — means
+    /// the capability could not be established, which is never permission.
+    pub fn from_flags(
+        signal_backend: Option<bool>,
+        reload_conf: Option<bool>,
+        reset_statements: Option<bool>,
+        maintain: Option<bool>,
+    ) -> Self {
+        Capabilities {
+            signal_backend: signal_backend.unwrap_or(false),
+            reload_conf: reload_conf.unwrap_or(false),
+            reset_statements: reset_statements.unwrap_or(false),
+            maintain: maintain.unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     pub version_num: i32,
     pub version_display: String,
     pub privilege: PrivilegeLevel,
     pub statements: StatementsAvailability,
+    pub capabilities: Capabilities,
 }
 
 impl ServerInfo {
@@ -129,11 +181,21 @@ pub fn map_server_info(row: &Row) -> ServerInfo {
     let is_monitor: bool = row.get("is_monitor");
     let is_superuser: bool = row.get("is_superuser");
     let statements_version: Option<String> = row.get("statements_version");
+    let can_signal: Option<bool> = row.get("can_signal");
+    let can_reload: Option<bool> = row.get("can_reload");
+    let can_reset_statements: Option<bool> = row.get("can_reset_statements");
+    let can_maintain: Option<bool> = row.get("can_maintain");
     ServerInfo {
         version_num,
         version_display: format_version(version_num),
         privilege: PrivilegeLevel::classify(is_superuser, is_monitor),
         statements: StatementsAvailability::classify(statements_version.as_deref()),
+        capabilities: Capabilities::from_flags(
+            can_signal,
+            can_reload,
+            can_reset_statements,
+            can_maintain,
+        ),
     }
 }
 
@@ -186,6 +248,7 @@ mod tests {
             version_display: format_version(130015),
             privilege: PrivilegeLevel::Superuser,
             statements: StatementsAvailability::NotInstalled,
+            capabilities: Capabilities::default(),
         };
         assert!(server_13.is_below_floor());
 
@@ -194,6 +257,7 @@ mod tests {
             version_display: format_version(140000),
             privilege: PrivilegeLevel::Superuser,
             statements: StatementsAvailability::NotInstalled,
+            capabilities: Capabilities::default(),
         };
         assert!(!server_14.is_below_floor());
 
@@ -202,6 +266,7 @@ mod tests {
             version_display: format_version(180000),
             privilege: PrivilegeLevel::Superuser,
             statements: StatementsAvailability::NotInstalled,
+            capabilities: Capabilities::default(),
         };
         assert!(!server_18.is_below_floor());
     }
@@ -268,5 +333,35 @@ mod tests {
         assert!(StatementsAvailability::classify(Some("1.9")).is_available());
         assert!(!StatementsAvailability::classify(Some("1.7")).is_available());
         assert!(!StatementsAvailability::classify(None).is_available());
+    }
+
+    #[test]
+    fn absent_objects_probe_as_no_capability() {
+        // to_regprocedure returns NULL when pg_stat_statements is absent, and
+        // the pg_roles subselect returns no row on 14-16 where pg_maintain
+        // does not exist. Both reach us as None and must not be read as
+        // permission.
+        let caps = Capabilities::from_flags(Some(false), Some(false), None, None);
+        assert!(!caps.reset_statements);
+        assert!(!caps.maintain);
+    }
+
+    #[test]
+    fn granted_capabilities_are_carried_through_independently() {
+        let caps = Capabilities::from_flags(Some(true), Some(false), Some(true), Some(false));
+        assert!(caps.signal_backend);
+        assert!(!caps.reload_conf);
+        assert!(caps.reset_statements);
+        assert!(!caps.maintain);
+    }
+
+    #[test]
+    fn a_monitor_role_has_no_action_capabilities_by_default() {
+        // The parent spec says the privilege probe gates the action buttons.
+        // It does not: pg_monitor grants no right to signal a backend. This
+        // test is the guard against that conflation coming back.
+        let caps = Capabilities::from_flags(Some(false), Some(false), Some(false), Some(false));
+        assert!(!caps.signal_backend);
+        assert!(!caps.reload_conf);
     }
 }
