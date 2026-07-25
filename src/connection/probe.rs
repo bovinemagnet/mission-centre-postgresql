@@ -26,10 +26,18 @@ pub const MIN_SUPPORTED_VERSION: i32 = 140000;
 
 /// Every capability expression must be written so it cannot raise on a server
 /// that lacks the object it names: this query runs on every connect, and a
-/// probe that fails fails the connection. `to_regprocedure` yields NULL rather
-/// than raising when pg_stat_statements is absent, and the `pg_roles`
-/// subselect returns no row on 14-16, where `pg_maintain` does not exist — a
-/// bare `pg_has_role(current_user, 'pg_maintain', 'member')` would raise there.
+/// probe that fails fails the connection. Each subselect returns no row rather
+/// than raising when its object is absent, and the `pg_roles` one covers 14-16,
+/// where `pg_maintain` does not exist — a bare
+/// `pg_has_role(current_user, 'pg_maintain', 'member')` would raise there.
+///
+/// The reset function is looked up **by name, never by signature**. From
+/// pg_stat_statements 1.11 it is declared `(oid, oid, bigint, boolean)` with
+/// every argument defaulted, so there is no zero-argument overload and
+/// `to_regprocedure('pg_stat_statements_reset()')` yields NULL on a server that
+/// has the extension installed and working. `bool_or` over the matching rows
+/// gives the answer for any version, and NULL — hence false — when the
+/// extension is absent entirely.
 ///
 /// Superusers need no special case: `pg_has_role` and `has_function_privilege`
 /// both return true for them.
@@ -41,9 +49,9 @@ SELECT current_setting('server_version_num')::int AS version_num,
          AS statements_version,
        pg_has_role(current_user, 'pg_signal_backend', 'member') AS can_signal,
        has_function_privilege(current_user, 'pg_reload_conf()', 'execute') AS can_reload,
-       (SELECT has_function_privilege(current_user, p.oid, 'execute')
+       (SELECT bool_or(has_function_privilege(current_user, p.oid, 'execute'))
           FROM pg_proc p
-         WHERE p.oid = to_regprocedure('pg_stat_statements_reset()'))
+         WHERE p.proname = 'pg_stat_statements_reset')
          AS can_reset_statements,
        (SELECT pg_has_role(current_user, oid, 'member')
           FROM pg_roles WHERE rolname = 'pg_maintain')

@@ -599,6 +599,48 @@ async fn assert_capability_probe_runs(tag: &str) {
     );
 }
 
+/// The absent-extension case above cannot catch the opposite mistake: a probe
+/// that finds nothing on a server where the reset function is present and
+/// callable. From pg_stat_statements 1.11 the function carries four defaulted
+/// arguments and has no zero-argument overload, so a signature-based lookup
+/// silently reports "not permitted" on a perfectly good server and the menu
+/// item is disabled for ever.
+async fn assert_reset_capability_is_seen(tag: &str) {
+    let (client, _container) = connect_with_statements(tag).await;
+
+    let row = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run with the extension installed");
+    let info = map_server_info(&row);
+    assert!(
+        info.statements.is_available(),
+        "the fixture installs the extension"
+    );
+    assert!(
+        info.capabilities.reset_statements,
+        "a superuser on a server carrying pg_stat_statements may reset it"
+    );
+
+    // Prove the capability was not merely reported: the statement it gates
+    // must actually run.
+    let plan = plan_for(&Action::ResetStatements);
+    client
+        .execute(plan.sql.as_str(), &[])
+        .await
+        .expect("pg_stat_statements_reset must run when the probe says it may");
+}
+
+#[tokio::test]
+async fn reset_capability_is_seen_on_postgres_14() {
+    assert_reset_capability_is_seen("14").await;
+}
+
+#[tokio::test]
+async fn reset_capability_is_seen_on_postgres_18() {
+    assert_reset_capability_is_seen("18").await;
+}
+
 #[tokio::test]
 async fn capability_probe_runs_on_postgres_14() {
     assert_capability_probe_runs("14").await;
