@@ -24,6 +24,8 @@
 
 use std::time::Duration;
 
+use mission_centre_pg::actions::sql::plan_for;
+use mission_centre_pg::actions::{Action, MaintenanceKind};
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -605,4 +607,66 @@ async fn capability_probe_runs_on_postgres_14() {
 #[tokio::test]
 async fn capability_probe_runs_on_postgres_18() {
     assert_capability_probe_runs("18").await;
+}
+
+/// Every action statement must actually run on both supported extremes. The
+/// two that could plausibly break are the maintenance ones: `batch_execute`
+/// carries them on the simple protocol because VACUUM cannot run inside the
+/// implicit transaction the extended protocol opens.
+async fn assert_action_statements_run(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute("CREATE TABLE orders (id bigserial PRIMARY KEY, note text)")
+        .await
+        .expect("failed to create the sample table");
+
+    for kind in [
+        MaintenanceKind::Analyze,
+        MaintenanceKind::Vacuum,
+        MaintenanceKind::VacuumAnalyze,
+    ] {
+        let plan = plan_for(&Action::Maintain {
+            kind,
+            schema: "public".to_string(),
+            table: "orders".to_string(),
+        });
+        client
+            .batch_execute(&plan.setup)
+            .await
+            .expect("the maintenance session settings must apply");
+        client
+            .batch_execute(&plan.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{:?} failed: {e}", plan.sql));
+    }
+
+    let reload = plan_for(&Action::ReloadConfig);
+    client
+        .batch_execute(&reload.setup)
+        .await
+        .expect("the quick session settings must apply");
+    client
+        .execute(reload.sql.as_str(), &[])
+        .await
+        .expect("pg_reload_conf must run as superuser");
+
+    // A backend that has already gone: the signal returns false rather than
+    // raising, which is the NoSuchBackend case the UI reports honestly.
+    let cancel = plan_for(&Action::CancelBackend { pid: 1 });
+    let row = client
+        .query_one(cancel.sql.as_str(), &[&cancel.pid.expect("a pid")])
+        .await
+        .expect("pg_cancel_backend must run");
+    let signalled: bool = row.get(0);
+    assert!(!signalled, "PID 1 is not a backend of this server");
+}
+
+#[tokio::test]
+async fn action_statements_run_on_postgres_14() {
+    assert_action_statements_run("14").await;
+}
+
+#[tokio::test]
+async fn action_statements_run_on_postgres_18() {
+    assert_action_statements_run("18").await;
 }

@@ -28,6 +28,8 @@ use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{error::SqlState, Client, NoTls, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::actions::{Action, ActionOutcome};
+use crate::collector::action_runner::run_action;
 use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
@@ -75,17 +77,40 @@ pub enum CollectorEvent {
     Error(CollectorError),
     Disconnected,
     History(Box<HistoryPreload>),
+    /// Emitted as the action's task starts, so a long-running maintenance
+    /// action can post an in-flight notice rather than appearing to do
+    /// nothing for minutes.
+    ActionStarted(Action),
+    ActionFinished {
+        action: Action,
+        outcome: ActionOutcome,
+    },
 }
 
 pub struct CollectorHandle {
     pub events: async_channel::Receiver<CollectorEvent>,
     stop: async_channel::Sender<()>,
+    commands: async_channel::Sender<Action>,
 }
 
 impl CollectorHandle {
     pub fn stop(&self) {
         let _ = self.stop.try_send(());
     }
+
+    /// Offers an action to the collector. False means it was not accepted —
+    /// the collector has gone, or too many actions are already queued — and
+    /// the caller must say so rather than let the user believe it ran.
+    pub fn submit(&self, action: Action) -> bool {
+        offer_command(&self.commands, action)
+    }
+}
+
+/// Non-blocking offer of one command. A full channel refuses rather than
+/// queues: these are destructive actions, and a terminate the user gave up on
+/// must not arrive a minute later.
+fn offer_command(commands: &async_channel::Sender<Action>, action: Action) -> bool {
+    commands.try_send(action).is_ok()
 }
 
 impl Drop for CollectorHandle {
@@ -245,6 +270,9 @@ pub fn spawn(
 ) -> CollectorHandle {
     let (event_tx, event_rx) = async_channel::bounded(32);
     let (stop_tx, stop_rx) = async_channel::bounded(1);
+    // Eight is far more than a human clicking buttons can produce; a full
+    // channel means something is wrong, and refusing is the right answer.
+    let (command_tx, command_rx) = async_channel::bounded(8);
 
     std::thread::Builder::new()
         .name("mcpg-collector".to_string())
@@ -253,13 +281,14 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("failed to build the collector runtime");
-            runtime.block_on(run(params, password, config, event_tx, stop_rx));
+            runtime.block_on(run(params, password, config, event_tx, stop_rx, command_rx));
         })
         .expect("failed to spawn the collector thread");
 
     CollectorHandle {
         events: event_rx,
         stop: stop_tx,
+        commands: command_tx,
     }
 }
 
@@ -269,6 +298,7 @@ async fn run(
     config: CollectorConfig,
     events: async_channel::Sender<CollectorEvent>,
     stop: async_channel::Receiver<()>,
+    commands: async_channel::Receiver<Action>,
 ) {
     let mut consecutive_failures = 0u32;
     let mut history_preloaded = false;
@@ -324,8 +354,11 @@ async fn run(
                     &mut history,
                     statements_available,
                     version_num,
+                    &params,
+                    &password,
                     &events,
                     &stop,
+                    &commands,
                 )
                 .await
                 {
@@ -368,7 +401,7 @@ async fn run(
     }
 }
 
-async fn connect(
+pub(crate) async fn connect(
     params: &ConnectionParams,
     password: &str,
 ) -> Result<(Client, ServerInfo), CollectorError> {
@@ -456,14 +489,18 @@ fn install_crypto_provider() {
 /// Samples serially: the next sample starts only once the previous one has
 /// finished or timed out, so a slow server spreads samples out rather than
 /// piling overlapping queries onto one connection.
+#[allow(clippy::too_many_arguments)]
 async fn sample_loop(
     client: &Client,
     config: &CollectorConfig,
     history: &mut HistoryBackend,
     statements_available: bool,
     version_num: i32,
+    params: &ConnectionParams,
+    password: &str,
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
+    commands: &async_channel::Receiver<Action>,
 ) -> Exit {
     let mut previous: Option<(DatabaseCounters, Instant)> = None;
     let mut previous_statements: Option<(HashMap<StatementKey, StatementCounters>, Instant)> = None;
@@ -556,11 +593,52 @@ async fn sample_loop(
         }
         is_first_sample = false;
 
-        tokio::select! {
-            _ = tokio::time::sleep(config.interval) => {}
-            _ = stop.recv() => return Exit::Stopped,
+        // The wait is a deadline rather than a sleep so that receiving an
+        // action does not shorten the sampling interval: an action arriving
+        // 100ms into a 2s wait must not trigger the next sample 100ms early.
+        let deadline = tokio::time::Instant::now() + config.interval;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = stop.recv() => return Exit::Stopped,
+                command = commands.recv() => match command {
+                    Ok(action) => spawn_action(params, password, action, events),
+                    // The sender lives on `CollectorHandle`, so a closed
+                    // channel means the handle has gone — the same condition
+                    // `stop` reports.
+                    Err(_) => return Exit::Stopped,
+                },
+            }
         }
     }
+}
+
+/// Runs one action off the sampling path entirely. The task owns clones of
+/// everything it needs, so a VACUUM lasting minutes never touches the sample
+/// loop; the loop keeps driving the runtime, so the task still progresses.
+///
+/// The task is bound to the runtime, which is bound to the collector: dropping
+/// the handle cancels a running action. That is documented behaviour, and the
+/// in-flight notice in the window is what makes it visible.
+fn spawn_action(
+    params: &ConnectionParams,
+    password: &str,
+    action: Action,
+    events: &async_channel::Sender<CollectorEvent>,
+) {
+    let params = params.clone();
+    let password = password.to_string();
+    let events = events.clone();
+
+    tokio::spawn(async move {
+        let _ = events
+            .send(CollectorEvent::ActionStarted(action.clone()))
+            .await;
+        let outcome = run_action(&params, &password, &action).await;
+        let _ = events
+            .send(CollectorEvent::ActionFinished { action, outcome })
+            .await;
+    });
 }
 
 /// What the slow tier needs for one run. Present only on a slow tick.
@@ -683,7 +761,7 @@ async fn sample_relations(
     Ok(RelationsSample { tables, indexes })
 }
 
-pub(super) fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
+pub(crate) fn map_query_error(e: tokio_postgres::Error) -> CollectorError {
     if e.code() == Some(&SqlState::QUERY_CANCELED) {
         CollectorError::Timeout
     } else if e.is_closed() {

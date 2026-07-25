@@ -466,6 +466,7 @@ impl MissionCentrePgWindow {
             CollectorEvent::History(preload) => {
                 imp.overview_page.preload(&preload.system);
             }
+            CollectorEvent::ActionStarted(_) | CollectorEvent::ActionFinished { .. } => {}
         }
     }
 }
