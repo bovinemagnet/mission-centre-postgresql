@@ -18,6 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+pub mod actions;
 pub mod collector;
 pub mod connection;
 pub mod dialogs;
