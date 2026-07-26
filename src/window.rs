@@ -30,6 +30,7 @@ use mission_centre_pg::collector::worker::{
     spawn, CollectorConfig, CollectorEvent, CollectorHandle,
 };
 use mission_centre_pg::connection::params::{ConnectionParams, HistoryMode};
+use mission_centre_pg::connection::probe::Capabilities;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
@@ -51,6 +52,8 @@ mod imp {
         pub server_list: TemplateChild<gtk::ListBox>,
         #[template_child]
         pub add_server_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         #[template_child]
         pub privilege_banner: TemplateChild<adw::Banner>,
         #[template_child]
@@ -84,6 +87,12 @@ mod imp {
         /// The database of the currently selected server, for messages that
         /// name it. Extension presence is a per-database property.
         pub connected_database: RefCell<String>,
+        /// What the connected role may do. `None` when nothing is connected,
+        /// which is itself what disables every action.
+        pub capabilities: RefCell<Option<Capabilities>>,
+        pub connected: Cell<bool>,
+        /// The persistent notice for a maintenance action still running.
+        pub in_flight_toast: RefCell<Option<adw::Toast>>,
     }
 
     #[glib::object_subclass]
@@ -130,6 +139,7 @@ mod imp {
                 }
             });
 
+            self.obj().install_actions();
             self.obj().reload_servers();
         }
     }
@@ -279,6 +289,9 @@ impl MissionCentrePgWindow {
         // The below-floor warning belongs to the previously connected server;
         // clear it so it cannot survive onto the server about to be selected.
         imp.below_floor_warning.replace(None);
+        // Capabilities belong to the connection being left; leaving them set
+        // would offer actions on a server that has not yet connected.
+        self.set_capabilities(None);
 
         if let Some(handle) = imp.collector.take() {
             handle.stop();
@@ -408,6 +421,7 @@ impl MissionCentrePgWindow {
                 );
                 imp.relations_page
                     .set_database(&imp.connected_database.borrow());
+                self.set_capabilities(Some(info.capabilities));
 
                 if info.is_below_floor() {
                     let message = i18n_f(
@@ -450,21 +464,29 @@ impl MissionCentrePgWindow {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);
                 }
+                // A refresh that dropped the selected row must disable the
+                // buttons now, not at the next selection change.
+                self.update_action_enablement();
             }
             CollectorEvent::Error(error) => {
                 imp.error_banner.set_revealed(true);
                 imp.error_banner.set_title(&i18n(&error.to_string()));
+                self.set_capabilities(None);
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Failed);
                 }
             }
             CollectorEvent::Disconnected => {
+                self.set_capabilities(None);
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Disconnected);
                 }
             }
             CollectorEvent::History(preload) => {
                 imp.overview_page.preload(&preload.system);
+            }
+            event @ (CollectorEvent::ActionStarted(_) | CollectorEvent::ActionFinished { .. }) => {
+                self.handle_action_event(event);
             }
         }
     }

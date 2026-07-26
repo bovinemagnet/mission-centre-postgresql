@@ -20,6 +20,17 @@
 
 use tokio_postgres::Row;
 
+/// Whether the connected role may maintain a given table is a property of the
+/// row, not of the connection: a table owner may VACUUM their own tables
+/// holding no server-wide privilege at all.
+///
+/// This is the first query in the project that genuinely branches on server
+/// version, which is what the parent spec §5 deferred `sql_for(version)` for.
+/// `has_table_privilege(..., 'MAINTAIN')` raises *unrecognized privilege type*
+/// before PostgreSQL 17, so 14 through 16 fall back to an ownership check —
+/// which also covers superusers, who are members of every role.
+const MAINTAIN_PRIVILEGE_VERSION: i32 = 170000;
+
 /// Table statistics for the connected database. `pg_stat_user_tables` is
 /// per-database; there is no server-wide equivalent.
 ///
@@ -27,7 +38,15 @@ use tokio_postgres::Row;
 /// correct: a table with no indexes has had no index scans. `GREATEST` over
 /// the two vacuum timestamps is NULL only when neither route has ever
 /// vacuumed the table, which is itself the interesting answer.
-pub const TABLES_SQL: &str = "\
+pub fn tables_sql(version_num: i32) -> String {
+    let can_maintain = if version_num >= MAINTAIN_PRIVILEGE_VERSION {
+        "has_table_privilege(current_user, c.oid, 'MAINTAIN')"
+    } else {
+        "pg_has_role(current_user, c.relowner, 'MEMBER')"
+    };
+
+    format!(
+        "\
 SELECT t.schemaname::text AS schema_name,
        t.relname::text    AS table_name,
        t.seq_scan,
@@ -41,10 +60,14 @@ SELECT t.schemaname::text AS schema_name,
        t.n_dead_tup,
        EXTRACT(EPOCH FROM (now() - GREATEST(t.last_vacuum, t.last_autovacuum)))::float8
          AS secs_since_vacuum,
-       pg_total_relation_size(t.relid)::int8 AS total_bytes
+       pg_total_relation_size(t.relid)::int8 AS total_bytes,
+       {can_maintain} AS can_maintain
   FROM pg_stat_user_tables t
+  JOIN pg_class c ON c.oid = t.relid
  ORDER BY total_bytes DESC
- LIMIT $1";
+ LIMIT $1"
+    )
+}
 
 /// Index statistics joined to `pg_index` for the constraint flags. Those
 /// flags are what stop every primary key being reported as an unused index.
@@ -80,9 +103,18 @@ pub struct TableStats {
     /// `None` when neither a manual nor an automatic vacuum has ever run.
     pub secs_since_vacuum: Option<f64>,
     pub total_bytes: i64,
+    /// True when the connected role may maintain this specific table —
+    /// through ownership, a granted MAINTAIN, or superuser.
+    pub can_maintain: bool,
 }
 
 impl TableStats {
+    /// Whether maintenance may run on this table, combining the row's own
+    /// answer with the connection's server-wide `pg_maintain` membership.
+    pub fn may_maintain(&self, server_wide: bool) -> bool {
+        self.can_maintain || server_wide
+    }
+
     /// Dead tuples as a fraction of all tuples. `None` for a table with no
     /// tuples at all — this is the component of bloat a statistic can see,
     /// which is why the column is named for dead tuples and not for bloat.
@@ -151,6 +183,7 @@ pub fn map_table_stats(row: &Row) -> TableStats {
         n_dead_tup: row.get("n_dead_tup"),
         secs_since_vacuum: row.get("secs_since_vacuum"),
         total_bytes: row.get("total_bytes"),
+        can_maintain: row.get("can_maintain"),
     }
 }
 
@@ -188,6 +221,7 @@ mod tests {
             n_dead_tup: dead,
             secs_since_vacuum: None,
             total_bytes: 0,
+            can_maintain: false,
         }
     }
 
@@ -250,5 +284,78 @@ mod tests {
     #[test]
     fn an_unscanned_unique_index_is_not_reported_as_unused() {
         assert!(!index(0, false, true).is_unused());
+    }
+
+    #[test]
+    fn postgres_17_and_later_ask_for_the_maintain_privilege() {
+        for version in [170000, 180004] {
+            let sql = tables_sql(version);
+            assert!(
+                sql.contains("has_table_privilege(current_user, c.oid, 'MAINTAIN')"),
+                "{version} should use the MAINTAIN privilege"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_16_and_earlier_fall_back_to_ownership() {
+        // has_table_privilege raises "unrecognized privilege type" for
+        // MAINTAIN before 17, and a raising slow-tier query costs the page.
+        for version in [140011, 160002] {
+            let sql = tables_sql(version);
+            assert!(
+                sql.contains("pg_has_role(current_user, c.relowner, 'MEMBER')"),
+                "{version} should fall back to an ownership check"
+            );
+            assert!(
+                !sql.contains("'MAINTAIN'"),
+                "{version} must never mention a privilege it cannot parse"
+            );
+        }
+    }
+
+    #[test]
+    fn every_version_still_selects_the_same_columns() {
+        for version in [140011, 180004] {
+            let sql = tables_sql(version);
+            assert!(sql.contains("AS can_maintain"));
+            assert!(sql.contains("pg_total_relation_size"));
+            assert!(sql.ends_with("LIMIT $1"));
+        }
+    }
+
+    #[test]
+    fn a_server_wide_privilege_covers_a_table_the_role_does_not_own() {
+        let table = table_stats_with(false);
+        assert!(table.may_maintain(true));
+        assert!(!table.may_maintain(false));
+    }
+
+    #[test]
+    fn an_owned_table_is_maintainable_without_any_server_privilege() {
+        // The common case for an application role: it owns its own tables and
+        // holds nothing else. Greying the button out here is the failure this
+        // whole column exists to avoid.
+        let table = table_stats_with(true);
+        assert!(table.may_maintain(false));
+    }
+
+    fn table_stats_with(can_maintain: bool) -> TableStats {
+        TableStats {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            seq_scan: 0,
+            seq_tup_read: 0,
+            idx_scan: 0,
+            idx_tup_fetch: 0,
+            n_tup_ins: 0,
+            n_tup_upd: 0,
+            n_tup_del: 0,
+            n_live_tup: 0,
+            n_dead_tup: 0,
+            secs_since_vacuum: None,
+            total_bytes: 0,
+            can_maintain,
+        }
     }
 }

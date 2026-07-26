@@ -24,12 +24,14 @@
 
 use std::time::Duration;
 
+use mission_centre_pg::actions::sql::plan_for;
+use mission_centre_pg::actions::{Action, MaintenanceKind};
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
 };
 use mission_centre_pg::collector::relations::{
-    map_index_stats, map_table_stats, INDEXES_SQL, TABLES_SQL,
+    map_index_stats, map_table_stats, tables_sql, INDEXES_SQL,
 };
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
 use mission_centre_pg::collector::statements::{
@@ -342,6 +344,13 @@ async fn a_delta_is_derived_across_two_statement_samples() {
 async fn assert_relations_sql_runs(tag: &str) {
     let (client, _container) = connect(tag).await;
 
+    let version_num: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .expect("failed to read the server version")
+        .get(0);
+    let tables_query = tables_sql(version_num);
+
     // pg_stat_user_tables excludes system catalogues, so a stock container
     // has nothing to report until a user table exists.
     client
@@ -361,7 +370,7 @@ async fn assert_relations_sql_runs(tag: &str) {
     // immediately, which would race that throttle.
     let orders = wait_for(|| async {
         let rows = client
-            .query(TABLES_SQL, &[&200i64])
+            .query(&tables_query, &[&200i64])
             .await
             .expect("pg_stat_user_tables query failed");
         rows.iter()
@@ -371,6 +380,10 @@ async fn assert_relations_sql_runs(tag: &str) {
     .await
     .expect("the orders table should be reported with a dead-tuple ratio once stats flush");
     assert!(orders.total_bytes > 0, "the table should have a size");
+    assert!(
+        orders.can_maintain,
+        "postgres owns the table it created and must be able to maintain it"
+    );
 
     let rows = client
         .query(INDEXES_SQL, &[&200i64])
@@ -541,4 +554,161 @@ async fn pgconsole_probe_and_round_trip_on_postgres_14() {
 #[tokio::test]
 async fn pgconsole_probe_and_round_trip_on_postgres_18() {
     assert_pgconsole_probe_and_round_trip("18").await;
+}
+
+/// The four capability columns must run on every supported major. The two
+/// guarded expressions are the point: `to_regprocedure` on a server without
+/// pg_stat_statements, and the `pg_roles` subselect on a server without
+/// `pg_maintain` (14 through 16). Either written naively raises, and a raising
+/// probe fails the connection outright.
+async fn assert_capability_probe_runs(tag: &str) {
+    let (client, container) = connect(tag).await;
+
+    let row = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run on a stock server with no extension");
+    let info = map_server_info(&row);
+    assert!(
+        info.capabilities.signal_backend,
+        "postgres is a superuser and must be able to signal"
+    );
+    assert!(info.capabilities.reload_conf);
+    assert!(
+        !info.capabilities.reset_statements,
+        "the extension is absent, so the reset function does not exist"
+    );
+
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the unprivileged role");
+    let plain = connect_as(&container, "plain", "plain").await;
+    let row = plain
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run for an unprivileged role too");
+    let info = map_server_info(&row);
+    assert!(
+        !info.capabilities.signal_backend,
+        "a plain role may not signal other backends"
+    );
+    assert!(
+        !info.capabilities.maintain,
+        "a plain role holds no server-wide maintenance privilege"
+    );
+}
+
+/// The absent-extension case above cannot catch the opposite mistake: a probe
+/// that finds nothing on a server where the reset function is present and
+/// callable. From pg_stat_statements 1.11 the function carries four defaulted
+/// arguments and has no zero-argument overload, so a signature-based lookup
+/// silently reports "not permitted" on a perfectly good server and the menu
+/// item is disabled for ever.
+async fn assert_reset_capability_is_seen(tag: &str) {
+    let (client, _container) = connect_with_statements(tag).await;
+
+    let row = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("the probe must run with the extension installed");
+    let info = map_server_info(&row);
+    assert!(
+        info.statements.is_available(),
+        "the fixture installs the extension"
+    );
+    assert!(
+        info.capabilities.reset_statements,
+        "a superuser on a server carrying pg_stat_statements may reset it"
+    );
+
+    // Prove the capability was not merely reported: the statement it gates
+    // must actually run.
+    let plan = plan_for(&Action::ResetStatements);
+    client
+        .execute(plan.sql.as_str(), &[])
+        .await
+        .expect("pg_stat_statements_reset must run when the probe says it may");
+}
+
+#[tokio::test]
+async fn reset_capability_is_seen_on_postgres_14() {
+    assert_reset_capability_is_seen("14").await;
+}
+
+#[tokio::test]
+async fn reset_capability_is_seen_on_postgres_18() {
+    assert_reset_capability_is_seen("18").await;
+}
+
+#[tokio::test]
+async fn capability_probe_runs_on_postgres_14() {
+    assert_capability_probe_runs("14").await;
+}
+
+#[tokio::test]
+async fn capability_probe_runs_on_postgres_18() {
+    assert_capability_probe_runs("18").await;
+}
+
+/// Every action statement must actually run on both supported extremes. The
+/// two that could plausibly break are the maintenance ones: `batch_execute`
+/// carries them on the simple protocol because VACUUM cannot run inside the
+/// implicit transaction the extended protocol opens.
+async fn assert_action_statements_run(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute("CREATE TABLE orders (id bigserial PRIMARY KEY, note text)")
+        .await
+        .expect("failed to create the sample table");
+
+    for kind in [
+        MaintenanceKind::Analyze,
+        MaintenanceKind::Vacuum,
+        MaintenanceKind::VacuumAnalyze,
+    ] {
+        let plan = plan_for(&Action::Maintain {
+            kind,
+            schema: "public".to_string(),
+            table: "orders".to_string(),
+        });
+        client
+            .batch_execute(&plan.setup)
+            .await
+            .expect("the maintenance session settings must apply");
+        client
+            .batch_execute(&plan.sql)
+            .await
+            .unwrap_or_else(|e| panic!("{:?} failed: {e}", plan.sql));
+    }
+
+    let reload = plan_for(&Action::ReloadConfig);
+    client
+        .batch_execute(&reload.setup)
+        .await
+        .expect("the quick session settings must apply");
+    client
+        .execute(reload.sql.as_str(), &[])
+        .await
+        .expect("pg_reload_conf must run as superuser");
+
+    // A backend that has already gone: the signal returns false rather than
+    // raising, which is the NoSuchBackend case the UI reports honestly.
+    let cancel = plan_for(&Action::CancelBackend { pid: 1 });
+    let row = client
+        .query_one(cancel.sql.as_str(), &[&cancel.pid.expect("a pid")])
+        .await
+        .expect("pg_cancel_backend must run");
+    let signalled: bool = row.get(0);
+    assert!(!signalled, "PID 1 is not a backend of this server");
+}
+
+#[tokio::test]
+async fn action_statements_run_on_postgres_14() {
+    assert_action_statements_run("14").await;
+}
+
+#[tokio::test]
+async fn action_statements_run_on_postgres_18() {
+    assert_action_statements_run("18").await;
 }

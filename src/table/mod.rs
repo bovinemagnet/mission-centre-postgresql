@@ -36,6 +36,22 @@ pub type Renderer<T> = fn(&T) -> String;
 /// numerically rather than lexically (so "10" sorts after "9").
 pub type NumericKey<T> = fn(&T) -> f64;
 
+/// A row's stable identity, used to re-establish the selection after the
+/// two-second refresh replaces every row object in the store.
+pub type RowKey<T> = fn(&T) -> String;
+
+/// Where `previous` sits in the current view order, if it is still there.
+///
+/// The keys must come from the *view* — filtered and sorted — not from the
+/// store: a store index is not a view index, and `SingleSelection` indexes
+/// into the view.
+pub fn reselect_index(keys: impl Iterator<Item = String>, previous: Option<&str>) -> Option<u32> {
+    let previous = previous?;
+    keys.enumerate()
+        .find(|(_, key)| key == previous)
+        .map(|(index, _)| index as u32)
+}
+
 /// Orders two rows for a column. Numeric columns compare by their numeric
 /// key; the rest compare lexically on the rendered text. A pure function so
 /// the numeric-versus-lexical behaviour is testable without a GTK widget in
@@ -103,22 +119,27 @@ impl McpgRowObject {
     }
 }
 
-/// The store, filter and sorter behind one `ColumnView`. The type parameter
-/// keeps the API typed even though the underlying row object erases it.
+/// The store, filter, sorter and selection behind one `ColumnView`. The type
+/// parameter keeps the API typed even though the underlying row object erases
+/// it.
 pub struct Table<T> {
     store: gio::ListStore,
     filter: gtk::CustomFilter,
+    selection: gtk::SingleSelection,
+    key: RowKey<T>,
     marker: PhantomData<T>,
 }
 
 impl<T: Clone + 'static> Table<T> {
     /// Builds the model, installs it on `view`, and appends one column per
     /// entry in `columns`. `matches` decides which rows the filter admits;
-    /// it is re-evaluated on every `refilter()`.
+    /// it is re-evaluated on every `refilter()`. `key` identifies a row across
+    /// refreshes so the user's selection survives them.
     pub fn attach(
         view: &gtk::ColumnView,
         columns: &[Column<T>],
         matches: impl Fn(&T) -> bool + 'static,
+        key: RowKey<T>,
     ) -> Self {
         let store = gio::ListStore::new::<McpgRowObject>();
 
@@ -138,7 +159,14 @@ impl<T: Clone + 'static> Table<T> {
         let sorted = gtk::SortListModel::new(Some(filtered), view.sorter());
         sorted.set_incremental(false);
 
-        view.set_model(Some(&gtk::NoSelection::new(Some(sorted))));
+        let selection = gtk::SingleSelection::new(Some(sorted));
+        // Both default the wrong way for us. `autoselect` would force a row to
+        // be selected at all times, so "nothing selected" — the state the
+        // action buttons need on a fresh connection, or once the selected
+        // backend exits — could not be represented at all.
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        view.set_model(Some(&selection));
 
         for column in columns {
             append_column(view, column);
@@ -147,19 +175,64 @@ impl<T: Clone + 'static> Table<T> {
         Table {
             store,
             filter,
+            selection,
+            key,
             marker: PhantomData,
         }
     }
 
     /// Replaces the contents in one splice, keeping items-changed to a single
     /// emission per sample rather than one per row.
+    ///
+    /// The splice destroys the selection, which on a two-second sample cadence
+    /// would mean the user could never keep a row selected long enough to act
+    /// on it. The selected row's key is therefore captured first and looked up
+    /// again afterwards.
     pub fn update(&self, rows: &[T]) {
+        let previous = self.selected_key();
         let objects: Vec<McpgRowObject> = rows.iter().cloned().map(McpgRowObject::new).collect();
         self.store.splice(0, self.store.n_items(), &objects);
+        self.restore_selection(previous.as_deref());
     }
 
     pub fn refilter(&self) {
         self.filter.changed(gtk::FilterChange::Different);
+    }
+
+    /// The selected row, or `None` when nothing is selected or the previously
+    /// selected row has gone.
+    pub fn selected(&self) -> Option<Rc<T>> {
+        self.selection
+            .selected_item()
+            .and_downcast::<McpgRowObject>()
+            .map(|object| object.row::<T>())
+    }
+
+    /// Runs `f` whenever the selection changes, including when a refresh
+    /// clears it because the row disappeared.
+    pub fn connect_selection_changed(&self, f: impl Fn() + 'static) {
+        self.selection.connect_selected_item_notify(move |_| f());
+    }
+
+    fn selected_key(&self) -> Option<String> {
+        self.selected().map(|row| (self.key)(row.as_ref()))
+    }
+
+    /// Keys in view order. Read from the selection model rather than the store
+    /// because the view is filtered and sorted.
+    fn view_keys(&self) -> Vec<String> {
+        (0..self.selection.n_items())
+            .filter_map(|index| self.selection.item(index))
+            .filter_map(|object| object.downcast::<McpgRowObject>().ok())
+            .map(|object| (self.key)(object.row::<T>().as_ref()))
+            .collect()
+    }
+
+    fn restore_selection(&self, previous: Option<&str>) {
+        match reselect_index(self.view_keys().into_iter(), previous) {
+            Some(index) => self.selection.set_selected(index),
+            None => self.selection.set_selected(gtk::INVALID_LIST_POSITION),
+        }
     }
 }
 
@@ -235,6 +308,37 @@ mod tests {
 
     fn count_key(row: &Row) -> f64 {
         row.count as f64
+    }
+
+    #[test]
+    fn a_row_still_present_is_reselected_at_its_new_index() {
+        // The table re-sorts under the user every two seconds. Reselecting by
+        // position would silently move the selection to a different backend.
+        let keys = ["4822".to_string(), "4821".to_string(), "4823".to_string()];
+        assert_eq!(reselect_index(keys.into_iter(), Some("4821")), Some(1));
+    }
+
+    #[test]
+    fn a_row_that_has_gone_clears_the_selection() {
+        let keys = ["4822".to_string(), "4823".to_string()];
+        assert_eq!(reselect_index(keys.into_iter(), Some("4821")), None);
+    }
+
+    #[test]
+    fn nothing_previously_selected_stays_nothing() {
+        let keys = ["4821".to_string()];
+        assert_eq!(reselect_index(keys.into_iter(), None), None);
+    }
+
+    #[test]
+    fn an_empty_table_clears_the_selection() {
+        assert_eq!(reselect_index(std::iter::empty(), Some("4821")), None);
+    }
+
+    #[test]
+    fn the_first_match_wins() {
+        let keys = ["a".to_string(), "b".to_string(), "b".to_string()];
+        assert_eq!(reselect_index(keys.into_iter(), Some("b")), Some(1));
     }
 
     #[test]

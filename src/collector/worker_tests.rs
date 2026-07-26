@@ -88,9 +88,11 @@ fn dropping_the_handle_sends_a_stop_signal_before_closing_the_channel() {
     // only the `Drop` impl's call to `self.stop()` can have produced.
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
     let (_event_tx, event_rx) = async_channel::bounded::<CollectorEvent>(1);
+    let (command_tx, _command_rx) = async_channel::bounded::<Action>(1);
     let handle = CollectorHandle {
         events: event_rx,
         stop: stop_tx,
+        commands: command_tx,
     };
 
     drop(handle);
@@ -220,4 +222,17 @@ fn a_tick_inside_the_interval_neither_attempts_nor_advances_last_slow() {
         false
     ));
     assert_eq!(last_slow, Some(recent));
+}
+
+#[test]
+fn a_full_command_channel_refuses_rather_than_queues() {
+    // Destructive actions must never pile up behind a wedged collector: a
+    // terminate the user gave up on and re-clicked five times should not
+    // arrive five times a minute later.
+    let (tx, rx) = async_channel::bounded::<Action>(2);
+    assert!(offer_command(&tx, Action::ReloadConfig));
+    assert!(offer_command(&tx, Action::ReloadConfig));
+    assert!(!offer_command(&tx, Action::ReloadConfig));
+    drop(rx);
+    assert!(!offer_command(&tx, Action::ReloadConfig));
 }

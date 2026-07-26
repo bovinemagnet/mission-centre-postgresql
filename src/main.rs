@@ -20,6 +20,7 @@
 
 mod application;
 mod window;
+mod window_actions;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};

@@ -226,6 +226,13 @@ const COLUMNS: &[Column<QueryRow>] = &[
     },
 ];
 
+/// Queries has no row action this phase, but the key is part of the shared
+/// signature and selection costs nothing — a clicked row simply stays
+/// highlighted through a refresh instead of flickering.
+fn query_row_key(row: &QueryRow) -> String {
+    format!("{:?}", row.statement.key)
+}
+
 mod imp {
     use super::*;
 
@@ -272,9 +279,12 @@ mod imp {
             self.delta_mode.set(true);
 
             let page = self.obj().clone();
-            let table = Table::attach(&self.column_view.get(), COLUMNS, move |row| {
-                page.matches(row)
-            });
+            let table = Table::attach(
+                &self.column_view.get(),
+                COLUMNS,
+                move |row| page.matches(row),
+                query_row_key,
+            );
             self.table.replace(Some(table));
 
             let page = self.obj().clone();

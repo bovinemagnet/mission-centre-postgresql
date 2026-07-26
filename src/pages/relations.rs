@@ -25,6 +25,7 @@ use adw::subclass::prelude::*;
 use gtk::glib;
 
 use crate::collector::relations::{IndexStats, RelationsSample, TableStats};
+use crate::connection::probe::Capabilities;
 use crate::i18n::{i18n, i18n_f};
 use crate::pages::format::{format_bytes, format_rate, format_ratio};
 use crate::table::{Column, Table};
@@ -206,6 +207,17 @@ const INDEX_COLUMNS: &[Column<IndexStats>] = &[
     },
 ];
 
+fn table_key(table: &TableStats) -> String {
+    format!("{}.{}", table.schema_name, table.table_name)
+}
+
+fn index_key(index: &IndexStats) -> String {
+    format!(
+        "{}.{}.{}",
+        index.schema_name, index.table_name, index.index_name
+    )
+}
+
 mod imp {
     use super::*;
 
@@ -228,6 +240,14 @@ mod imp {
         pub unused_only_toggle: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub indexes_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub maintain_reason: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub analyze_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub vacuum_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub vacuum_analyze_button: TemplateChild<gtk::Button>,
 
         pub tables: RefCell<Option<Table<TableStats>>>,
         pub indexes: RefCell<Option<Table<IndexStats>>>,
@@ -256,15 +276,21 @@ mod imp {
             self.parent_constructed();
 
             let page = self.obj().clone();
-            let tables = Table::attach(&self.tables_view.get(), TABLE_COLUMNS, move |table| {
-                page.table_matches(table)
-            });
+            let tables = Table::attach(
+                &self.tables_view.get(),
+                TABLE_COLUMNS,
+                move |table| page.table_matches(table),
+                table_key,
+            );
             self.tables.replace(Some(tables));
 
             let page = self.obj().clone();
-            let indexes = Table::attach(&self.indexes_view.get(), INDEX_COLUMNS, move |index| {
-                page.index_matches(index)
-            });
+            let indexes = Table::attach(
+                &self.indexes_view.get(),
+                INDEX_COLUMNS,
+                move |index| page.index_matches(index),
+                index_key,
+            );
             self.indexes.replace(Some(indexes));
 
             let page = self.obj().clone();
@@ -346,6 +372,39 @@ impl McpgRelationsPage {
         ));
     }
 
+    /// The selected table, or `None` when nothing is selected — including
+    /// after a refresh in which the table was dropped.
+    pub fn selected_table(&self) -> Option<TableStats> {
+        self.imp()
+            .tables
+            .borrow()
+            .as_ref()
+            .and_then(|table| table.selected())
+            .map(|row| (*row).clone())
+    }
+
+    pub fn connect_tables_selection_changed(&self, f: impl Fn() + 'static) {
+        if let Some(table) = self.imp().tables.borrow().as_ref() {
+            table.connect_selection_changed(f);
+        }
+    }
+
+    /// Shows why maintenance is unavailable when neither the connection nor
+    /// the selected table grants it. See the note on
+    /// `McpgSessionsPage::set_capabilities` for why this is a label and not
+    /// only a tooltip.
+    pub fn set_capabilities(&self, capabilities: &Capabilities) {
+        let selected_allows = self
+            .selected_table()
+            .map(|table| table.may_maintain(capabilities.maintain))
+            .unwrap_or(false);
+        let imp = self.imp();
+        imp.maintain_reason.set_visible(!selected_allows);
+        imp.maintain_reason.set_text(&i18n(
+            "Maintaining a table requires owning it, or membership of pg_maintain.",
+        ));
+    }
+
     /// Drops the tables and indexes from the previously selected server.
     /// Called on a server switch, not on a reconnect: until the new server's
     /// first slow sample arrives, the old server's rows would otherwise be
@@ -409,6 +468,7 @@ mod tests {
             n_dead_tup: 250,
             secs_since_vacuum: Some(3_600.0),
             total_bytes: 1_048_576,
+            can_maintain: true,
         }
     }
 
