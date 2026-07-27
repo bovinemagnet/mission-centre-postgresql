@@ -126,6 +126,7 @@ mod tests {
             },
             statements: None,
             relations: None,
+            locks: None,
         }
     }
 

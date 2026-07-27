@@ -31,6 +31,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::actions::{Action, ActionOutcome};
 use crate::collector::action_runner::run_action;
 use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
+use crate::collector::locks::{map_participant, LocksSample, BLOCKED_SQL};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -687,6 +688,19 @@ async fn sample(
         derive_rates(&prev_counters, &totals, taken_at.duration_since(prev_at))
     });
 
+    // Contention is transient, so this runs on every tick rather than the slow
+    // tier. `classify_slow` keeps a permission or query error to the one page,
+    // while a timeout or lost connection still fails the whole sample.
+    let locks = Some(classify_slow(
+        client
+            .query(BLOCKED_SQL, &[])
+            .await
+            .map_err(map_query_error)
+            .map(|rows| LocksSample {
+                participants: rows.iter().map(map_participant).collect(),
+            }),
+    )?);
+
     let (statements, relations) = match slow {
         None => (None, None),
         Some(slow) => {
@@ -716,6 +730,7 @@ async fn sample(
         settings,
         statements,
         relations,
+        locks,
     })
 }
 

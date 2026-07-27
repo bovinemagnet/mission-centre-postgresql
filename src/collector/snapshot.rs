@@ -20,6 +20,7 @@
 
 use std::time::Instant;
 
+use super::locks::LocksSample;
 use super::relations::RelationsSample;
 use super::statements::StatementsSample;
 use super::worker::CollectorError;
@@ -143,4 +144,7 @@ pub struct Snapshot {
     /// `Err` carries the reason the page renders in place of its table.
     pub statements: Option<Result<StatementsSample, CollectorError>>,
     pub relations: Option<Result<RelationsSample, CollectorError>>,
+    /// Fast tier, so `Some` on every tick. `Err` carries the reason the page
+    /// renders in place of its tree.
+    pub locks: Option<Result<LocksSample, CollectorError>>,
 }
