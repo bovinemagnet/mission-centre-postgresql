@@ -18,7 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -61,6 +61,21 @@ fn push_node(node: &LockNode, depth: usize, rows: &mut Vec<LockRow>) {
     });
     for child in &node.children {
         push_node(child, depth + 1, rows);
+    }
+}
+
+/// Which empty state to show when the tree has no rows.
+///
+/// A role without `pg_monitor` sees no `wait_event_type` for other users'
+/// backends, so the blocked-tree query filters them out entirely and returns
+/// nothing — indistinguishable, from the client, from a server with no
+/// contention at all. Reporting "No blocked sessions" there would assert a
+/// healthy server on evidence we do not have.
+pub fn empty_state_page(limited: bool) -> &'static str {
+    if limited {
+        "restricted"
+    } else {
+        "empty"
     }
 }
 
@@ -227,6 +242,8 @@ mod imp {
         #[template_child]
         pub view_stack: TemplateChild<adw::ViewStack>,
         #[template_child]
+        pub privilege_note: TemplateChild<adw::Banner>,
+        #[template_child]
         pub tree_stack: TemplateChild<gtk::Stack>,
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
@@ -245,6 +262,9 @@ mod imp {
 
         pub table: RefCell<Option<Table<LockRow>>>,
         pub inventory_table: RefCell<Option<Table<LockEntry>>>,
+        /// Whether the connected role lacks pg_monitor, which changes what an
+        /// empty tree is allowed to claim.
+        pub privilege_limited: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -381,6 +401,15 @@ impl McpgLocksPage {
         }
     }
 
+    /// Explains the blank Query cells a limited role sees, rather than
+    /// leaving them to read as "this backend is running nothing". The tree
+    /// itself is still complete: pg_blocking_pids needs no privilege.
+    pub fn set_privilege_limited(&self, limited: bool) {
+        let imp = self.imp();
+        imp.privilege_note.set_revealed(limited);
+        imp.privilege_limited.set(limited);
+    }
+
     /// Shows why the buttons are unavailable when the role cannot signal.
     /// A label rather than only a tooltip, because GTK does not deliver
     /// tooltips to insensitive widgets.
@@ -415,8 +444,11 @@ impl McpgLocksPage {
             table.update(&rows);
         }
 
-        imp.tree_stack
-            .set_visible_child_name(if rows.is_empty() { "empty" } else { "tree" });
+        imp.tree_stack.set_visible_child_name(if rows.is_empty() {
+            empty_state_page(imp.privilege_limited.get())
+        } else {
+            "tree"
+        });
     }
 }
 
@@ -465,6 +497,14 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].depth, 1);
         assert_eq!(rows[2].depth, 1);
+    }
+
+    #[test]
+    fn an_empty_tree_only_claims_there_is_no_contention_when_it_could_have_seen_it() {
+        assert_eq!(empty_state_page(false), "empty");
+        // A limited role's query returns nothing whether or not the server is
+        // contended, so the page must not report a healthy server.
+        assert_eq!(empty_state_page(true), "restricted");
     }
 
     #[test]

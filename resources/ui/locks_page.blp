@@ -4,6 +4,11 @@ using Adw 1;
 template $McpgLocksPage: Gtk.Box {
   orientation: vertical;
 
+  Adw.Banner privilege_note {
+    revealed: false;
+    title: _("Query text for other users' backends is hidden without pg_monitor.");
+  }
+
   Gtk.Box {
     halign: center;
     margin-top: 6;
@@ -45,6 +50,16 @@ template $McpgLocksPage: Gtk.Box {
               show-column-separators: true;
               reorderable: false;
             };
+          };
+        }
+
+        Gtk.StackPage {
+          name: "restricted";
+
+          child: Adw.StatusPage {
+            icon-name: "dialog-question-symbolic";
+            title: _("Contention cannot be seen");
+            description: _("Without pg_monitor, other users' backends are hidden from pg_stat_activity, so blocked sessions cannot be detected. This is not the same as there being none.");
           };
         }
 
