@@ -251,8 +251,6 @@ mod imp {
         pub privilege_note: TemplateChild<adw::Banner>,
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
-        #[template_child]
-        pub context_menu: TemplateChild<gio::MenuModel>,
 
         pub table: RefCell<Option<Table<QueryRow>>>,
         /// Held so the popover outlives the click that opened it.
@@ -431,7 +429,13 @@ impl McpgQueriesPage {
 
     fn popup_context_menu(&self, x: f64, y: f64) {
         let imp = self.imp();
-        let menu = gtk::PopoverMenu::from_model(Some(&imp.context_menu.get()));
+        // Built here rather than in the Blueprint: a top-level `menu` is not
+        // part of the template, so it cannot be bound as a template child.
+        // Trying to made the widget fail to build at runtime — a failure no
+        // unit test could have caught.
+        let model = gio::Menu::new();
+        model.append(Some(&i18n("Explain query")), Some("win.explain-query"));
+        let menu = gtk::PopoverMenu::from_model(Some(&model));
         menu.set_parent(&imp.column_view.get());
         menu.set_has_arrow(false);
         menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
