@@ -70,6 +70,8 @@ mod imp {
         pub relations_page: TemplateChild<McpgRelationsPage>,
         #[template_child]
         pub locks_page: TemplateChild<McpgLocksPage>,
+        #[template_child]
+        pub view_stack: TemplateChild<adw::ViewStack>,
 
         /// Shared with the collector: true only while the lock inventory view
         /// is on screen. Defaults to false, so the expensive query never runs

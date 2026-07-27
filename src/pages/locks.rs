@@ -27,6 +27,7 @@ use gtk::glib;
 use crate::collector::locks::{
     build_forest, LockEntry, LockInventorySample, LockNode, LockParticipant, LocksSample,
 };
+use crate::collector::snapshot::Session;
 use crate::collector::worker::CollectorError;
 use crate::connection::probe::Capabilities;
 use crate::i18n::i18n;
@@ -303,6 +304,33 @@ impl McpgLocksPage {
             .and_then(|table| table.selected())
             .filter(|row| !row.is_stub)
             .map(|row| row.participant.pid)
+    }
+
+    /// The selected backend as a `Session`, so the confirmation dialog and the
+    /// action machinery are shared with the Sessions page rather than
+    /// duplicated. A lock participant carries the same identifying fields.
+    pub fn selected_session(&self) -> Option<Session> {
+        let row = self
+            .imp()
+            .table
+            .borrow()
+            .as_ref()
+            .and_then(|table| table.selected())
+            .filter(|row| !row.is_stub)?;
+
+        Some(Session {
+            pid: row.participant.pid,
+            user_name: row.participant.user_name.clone(),
+            application_name: None,
+            client_addr: None,
+            database: row.participant.database.clone(),
+            state: row.participant.state.clone(),
+            wait_event_type: None,
+            wait_event: None,
+            backend_type: None,
+            query_duration_secs: row.participant.wait_secs,
+            query: row.participant.query.clone(),
+        })
     }
 
     pub fn connect_selection_changed(&self, f: impl Fn() + 'static) {
