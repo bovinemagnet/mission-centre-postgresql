@@ -14,7 +14,7 @@
 - **Author:** Paul Snow. **Version:** 0.0.0. Every new file carries the GPL-3.0-or-later header block copied from `src/pages/sessions.rs:1-19`.
 - **British spelling** in all comments, documentation and user-visible strings.
 - **PostgreSQL 14 is the version floor.** Every query must run on 14 and 18.
-- **No file may exceed ~800 lines.** If `src/collector/locks.rs` approaches it, split the tree builder into `src/collector/locks_tree.rs` — that is the intended seam.
+- **Prefer files under ~800 lines**, but this is a guideline rather than a hard limit: Paul confirmed on 2026-07-27 that a file may exceed it where splitting would mean restructuring unrelated code. `src/collector/worker.rs` sits at 813 lines after this phase. If `src/collector/locks.rs` grows unwieldy, the tree builder splitting into `src/collector/locks_tree.rs` is the intended seam.
 - **User-visible strings** go through `crate::i18n::i18n`.
 - **TDD throughout:** the failing test comes first, and is run and seen to fail before any implementation.
 - **Commands:** `cargo test --lib`, `cargo test --bin mission-centre-pg`, `ninja -C build`. Portability tests need `export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock"` and run with `cargo test --test portability`.
