@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use mission_centre_pg::actions::sql::plan_for;
 use mission_centre_pg::actions::{Action, MaintenanceKind};
+use mission_centre_pg::collector::locks::{build_forest, map_participant, BLOCKED_SQL};
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -711,4 +712,121 @@ async fn action_statements_run_on_postgres_14() {
 #[tokio::test]
 async fn action_statements_run_on_postgres_18() {
     assert_action_statements_run("18").await;
+}
+
+/// The blocked-lock query must run on both versions, and must report nothing
+/// on a server with no contention — the healthy case the page renders as
+/// "No blocked sessions".
+async fn assert_blocked_sql_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(BLOCKED_SQL, &[])
+        .await
+        .expect("the blocked-lock query must run");
+
+    assert!(rows.is_empty(), "an idle server has no lock contention");
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_on_postgres_14() {
+    assert_blocked_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_on_postgres_18() {
+    assert_blocked_sql_runs("18").await;
+}
+
+/// Real contention, not a fixture: one transaction holds a row lock, a second
+/// waits on it. Proves the union of waiters and blockers produces a root
+/// carrying the holder's state, which is the whole point of the query.
+async fn assert_blocked_sql_finds_a_real_conflict(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute(
+            "CREATE TABLE conflict (id int PRIMARY KEY, note text);
+             INSERT INTO conflict VALUES (1, 'a')",
+        )
+        .await
+        .expect("failed to create the conflict table");
+
+    let holder = connect_as(&container, "postgres", "postgres").await;
+    holder
+        .batch_execute("BEGIN; UPDATE conflict SET note = 'held' WHERE id = 1")
+        .await
+        .expect("the holder must take the row lock");
+
+    let waiter = connect_as(&container, "postgres", "postgres").await;
+    let waiting = tokio::spawn(async move {
+        waiter
+            .execute("UPDATE conflict SET note = 'waiting' WHERE id = 1", &[])
+            .await
+    });
+
+    // The waiter needs a moment to reach the lock manager and register.
+    let forest = wait_for(|| async {
+        let rows = client.query(BLOCKED_SQL, &[]).await.ok()?;
+        let participants: Vec<_> = rows.iter().map(map_participant).collect();
+        let forest = build_forest(&participants);
+        (!forest.is_empty()).then_some(forest)
+    })
+    .await
+    .expect("the conflict must appear in the blocked-lock query");
+
+    assert_eq!(forest.len(), 1, "one chain, not several");
+    assert_eq!(forest[0].children.len(), 1, "with one waiter beneath it");
+    assert_eq!(
+        forest[0].participant.state.as_deref(),
+        Some("idle in transaction"),
+        "the root is the transaction holding the lock"
+    );
+    assert!(
+        forest[0].children[0].participant.waiting,
+        "the child is the backend actually waiting"
+    );
+
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("failed to release the lock");
+    let _ = waiting.await;
+}
+
+#[tokio::test]
+async fn blocked_sql_finds_a_real_conflict_on_postgres_14() {
+    assert_blocked_sql_finds_a_real_conflict("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_finds_a_real_conflict_on_postgres_18() {
+    assert_blocked_sql_finds_a_real_conflict("18").await;
+}
+
+/// Settles the privilege question by observation: a role without pg_monitor
+/// must still be able to run the query, whatever it does or does not mask.
+async fn assert_blocked_sql_runs_for_a_plain_role(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the plain role");
+
+    let plain = connect_as(&container, "plain", "plain").await;
+    let rows = plain
+        .query(BLOCKED_SQL, &[])
+        .await
+        .expect("a role without pg_monitor must still run the query");
+
+    assert!(rows.is_empty(), "an idle server has no lock contention");
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_for_a_plain_role_on_postgres_14() {
+    assert_blocked_sql_runs_for_a_plain_role("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_for_a_plain_role_on_postgres_18() {
+    assert_blocked_sql_runs_for_a_plain_role("18").await;
 }

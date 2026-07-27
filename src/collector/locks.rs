@@ -20,6 +20,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tokio_postgres::Row;
+
 /// One backend involved in a lock conflict — either waiting, or blocking
 /// somebody who is.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +69,68 @@ pub fn stub_participant(pid: i32) -> LockParticipant {
         database: None,
         state: None,
         query: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocksSample {
+    pub participants: Vec<LockParticipant>,
+}
+
+/// Every backend in a lock conflict, waiters and blockers alike.
+///
+/// `pg_blocking_pids` inspects lock manager state on every call, so it is
+/// evaluated only for backends actually waiting on a lock — on a healthy
+/// server that is no rows at all. The blockers are then unioned back in: a
+/// chain's root is typically `idle in transaction` and so waits on nobody,
+/// which would leave the top of the tree with no user, database or query —
+/// exactly the row the operator needs in order to decide whether terminating
+/// it is safe.
+pub const BLOCKED_SQL: &str = "\
+WITH waiters AS (
+    SELECT pid, pg_blocking_pids(pid) AS blocked_by
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock'
+),
+participants AS (
+    SELECT pid FROM waiters
+    UNION
+    SELECT unnest(blocked_by) FROM waiters
+)
+SELECT p.pid                                              AS pid,
+       coalesce(w.blocked_by, ARRAY[]::int[])             AS blocked_by,
+       (w.pid IS NOT NULL)                                AS waiting,
+       CASE WHEN w.pid IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (now() - a.query_start))::float8
+       END                                                AS wait_secs,
+       lk.mode                                            AS lock_mode,
+       lk.relation                                        AS relation,
+       a.usename::text                                    AS user_name,
+       a.datname::text                                    AS database,
+       a.state                                            AS state,
+       a.query                                            AS query
+FROM participants p
+JOIN pg_stat_activity a ON a.pid = p.pid
+LEFT JOIN waiters w ON w.pid = p.pid
+LEFT JOIN LATERAL (
+    SELECT l.mode, l.relation::regclass::text AS relation
+    FROM pg_locks l
+    WHERE l.pid = p.pid AND NOT l.granted
+    LIMIT 1
+) lk ON true";
+
+pub fn map_participant(row: &Row) -> LockParticipant {
+    LockParticipant {
+        pid: row.get("pid"),
+        blocked_by: row.get("blocked_by"),
+        waiting: row.get("waiting"),
+        wait_secs: row.get("wait_secs"),
+        lock_mode: row.get("lock_mode"),
+        relation: row.get("relation"),
+        user_name: row.get("user_name"),
+        database: row.get("database"),
+        state: row.get("state"),
+        query: row.get("query"),
     }
 }
 
