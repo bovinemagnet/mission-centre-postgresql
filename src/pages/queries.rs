@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::glib;
+use gtk::{gdk, gio, glib};
 
 use crate::collector::statements::{Statement, StatementCounters, StatementsSample};
 use crate::connection::probe::StatementsAvailability;
@@ -251,8 +251,12 @@ mod imp {
         pub privilege_note: TemplateChild<adw::Banner>,
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub context_menu: TemplateChild<gio::MenuModel>,
 
         pub table: RefCell<Option<Table<QueryRow>>>,
+        /// Held so the popover outlives the click that opened it.
+        pub context_popover: RefCell<Option<gtk::PopoverMenu>>,
         pub statements: RefCell<Vec<Statement>>,
         pub delta_mode: Cell<bool>,
         pub filter_text: RefCell<String>,
@@ -286,6 +290,19 @@ mod imp {
                 query_row_key,
             );
             self.table.replace(Some(table));
+
+            // Right-click selects the row under the pointer before showing the
+            // menu, so the menu cannot act on a different statement from the
+            // one the user pointed at.
+            let page = self.obj().clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gdk::BUTTON_SECONDARY);
+            gesture.connect_pressed(move |gesture, _n, x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                page.select_row_at(x, y);
+                page.popup_context_menu(x, y);
+            });
+            self.column_view.add_controller(gesture);
 
             let page = self.obj().clone();
             self.filter_entry.connect_search_changed(move |entry| {
@@ -396,6 +413,41 @@ impl McpgQueriesPage {
                 imp.stack.set_visible_child_name("unavailable");
             }
         }
+    }
+
+    /// Selects whatever row sits under the given widget coordinates. GTK does
+    /// not do this for a secondary click, so without it a right-click would
+    /// leave the previous selection in place and the menu would act on it.
+    fn select_row_at(&self, x: f64, y: f64) {
+        let view = self.imp().column_view.get();
+        // `listitem.select` is installed on the list item widget, and
+        // `activate_action` walks up from the picked cell to find it, so the
+        // row under the pointer becomes the selection without this code
+        // needing to know how a ColumnView nests its children.
+        if let Some(widget) = view.pick(x, y, gtk::PickFlags::DEFAULT) {
+            let _ = widget.activate_action("listitem.select", Some(&(false, false).to_variant()));
+        }
+    }
+
+    fn popup_context_menu(&self, x: f64, y: f64) {
+        let imp = self.imp();
+        let menu = gtk::PopoverMenu::from_model(Some(&imp.context_menu.get()));
+        menu.set_parent(&imp.column_view.get());
+        menu.set_has_arrow(false);
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        menu.popup();
+        imp.context_popover.replace(Some(menu));
+    }
+
+    /// The selected statement, or `None` when nothing is selected. Mirrors
+    /// `selected_session` on the Sessions page.
+    pub fn selected_statement(&self) -> Option<Statement> {
+        self.imp()
+            .table
+            .borrow()
+            .as_ref()
+            .and_then(|table| table.selected())
+            .map(|row| row.statement.clone())
     }
 
     pub fn set_privilege_limited(&self, limited: bool) {

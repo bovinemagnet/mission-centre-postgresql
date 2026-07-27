@@ -56,3 +56,12 @@ template $McpgQueriesPage: Gtk.Box {
     }
   }
 }
+
+menu query_context_menu {
+  section {
+    item {
+      label: _("Explain query");
+      action: "win.explain-query";
+    }
+  }
+}
