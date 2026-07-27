@@ -26,6 +26,7 @@ use mission_centre_pg::actions::{Action, ActionOutcome, MaintenanceKind};
 use mission_centre_pg::collector::snapshot::Session;
 use mission_centre_pg::collector::worker::CollectorEvent;
 use mission_centre_pg::connection::probe::Capabilities;
+use mission_centre_pg::explain::explain_sql;
 use mission_centre_pg::i18n::{i18n, i18n_f};
 
 use crate::window::MissionCentrePgWindow;
@@ -37,6 +38,7 @@ const ACTION_VACUUM: &str = "vacuum-table";
 const ACTION_VACUUM_ANALYZE: &str = "vacuum-analyze-table";
 const ACTION_RESET_STATEMENTS: &str = "reset-statements";
 const ACTION_RELOAD_CONF: &str = "reload-configuration";
+const ACTION_EXPLAIN: &str = "explain-query";
 
 /// Everything needed to tell one backend apart from another that looks like
 /// it. Fields the server withheld are simply omitted rather than rendered as
@@ -131,6 +133,7 @@ impl MissionCentrePgWindow {
             ACTION_VACUUM_ANALYZE,
             ACTION_RESET_STATEMENTS,
             ACTION_RELOAD_CONF,
+            ACTION_EXPLAIN,
         ] {
             let action = gio::SimpleAction::new(name, None);
             action.set_enabled(false);
@@ -177,6 +180,12 @@ impl MissionCentrePgWindow {
             ACTION_ANALYZE => self.maintenance_action(MaintenanceKind::Analyze),
             ACTION_VACUUM => self.maintenance_action(MaintenanceKind::Vacuum),
             ACTION_VACUUM_ANALYZE => self.maintenance_action(MaintenanceKind::VacuumAnalyze),
+            ACTION_EXPLAIN => {
+                // Not an Action: an explain returns data rather than changing
+                // anything, so it travels on its own channel.
+                self.explain_selected_query();
+                None
+            }
             ACTION_RESET_STATEMENTS => Some(Action::ResetStatements),
             ACTION_RELOAD_CONF => Some(Action::ReloadConfig),
             _ => None,
@@ -192,6 +201,37 @@ impl MissionCentrePgWindow {
         match imp.view_stack.visible_child_name().as_deref() {
             Some("locks") => imp.locks_page.selected_session(),
             _ => imp.sessions_page.selected_session(),
+        }
+    }
+
+    /// Asks the collector for a plan for the selected statement.
+    ///
+    /// Every refusal is reported: a right-click that silently does nothing
+    /// leaves the user waiting for a plan that was never requested.
+    fn explain_selected_query(&self) {
+        let imp = self.imp();
+
+        let Some(statement) = imp.queries_page.selected_statement() else {
+            return;
+        };
+        let Some(sql) = explain_sql(&statement.query) else {
+            self.add_toast_text(&i18n("That statement cannot be explained safely."));
+            return;
+        };
+
+        imp.plan_page
+            .show_pending(statement.key.clone(), &statement.query);
+
+        let submitted = imp
+            .collector
+            .borrow()
+            .as_ref()
+            .map(|collector| collector.explain(statement.key, sql))
+            .unwrap_or(false);
+
+        if !submitted {
+            imp.plan_page
+                .show_error(&i18n("The request was not accepted; nothing was sent."));
         }
     }
 
@@ -300,6 +340,8 @@ impl MissionCentrePgWindow {
         );
         self.set_action_enabled(ACTION_RELOAD_CONF, connected && capabilities.reload_conf);
 
+        self.set_action_enabled(ACTION_EXPLAIN, connected && imp.plan_page.is_supported());
+
         imp.sessions_page.set_capabilities(&capabilities);
         imp.relations_page.set_capabilities(&capabilities);
         imp.locks_page.set_capabilities(&capabilities);
@@ -340,7 +382,7 @@ impl MissionCentrePgWindow {
         }
     }
 
-    fn add_toast_text(&self, text: &str) {
+    pub(crate) fn add_toast_text(&self, text: &str) {
         self.imp().toast_overlay.add_toast(adw::Toast::new(text));
     }
 }

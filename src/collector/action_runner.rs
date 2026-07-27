@@ -20,7 +20,9 @@
 
 use crate::actions::sql::plan_for;
 use crate::actions::{signal_outcome, Action, ActionOutcome};
-use crate::collector::worker::{connect, map_query_error};
+use tokio_postgres::SimpleQueryMessage;
+
+use crate::collector::worker::{connect, map_query_error, CollectorError};
 use crate::connection::params::ConnectionParams;
 
 /// Runs one action on a connection of its own.
@@ -71,4 +73,39 @@ pub async fn run_action(
             Err(e) => ActionOutcome::Failed(map_query_error(e).to_string()),
         }
     }
+}
+
+/// Runs one `EXPLAIN` on a connection of its own and returns the plan as JSON.
+///
+/// Its own connection for the same reason an action has one: an EXPLAIN
+/// against a large catalogue can outlast a sampling interval, and the sampler
+/// must not be queued behind it. A failure here is returned to the caller
+/// rather than counted against the connection's failure budget — a statement
+/// that cannot be planned says nothing about the health of the connection.
+pub async fn run_explain(
+    params: &ConnectionParams,
+    password: &str,
+    sql: &str,
+) -> Result<String, CollectorError> {
+    let (client, _info) = connect(params, password).await?;
+
+    client
+        .batch_execute("SET statement_timeout = '5s'")
+        .await
+        .map_err(map_query_error)?;
+
+    // The simple query protocol, deliberately. Under the extended protocol the
+    // driver prepares the statement, reads the `$1` placeholders inside the
+    // statement being explained as parameters of its own, and refuses the call
+    // for passing none. psql succeeds for the same reason: it sends this
+    // simply. Values arrive as text, which is what the parser wants anyway.
+    let messages = client.simple_query(sql).await.map_err(map_query_error)?;
+
+    messages
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .ok_or_else(|| CollectorError::Query("the server returned no plan".to_string()))
 }

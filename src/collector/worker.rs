@@ -31,7 +31,7 @@ use tokio_postgres::{error::SqlState, Client, NoTls, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::actions::{Action, ActionOutcome};
-use crate::collector::action_runner::run_action;
+use crate::collector::action_runner::{run_action, run_explain};
 use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
 use crate::collector::locks::{sample_lock_inventory, sample_locks};
 use crate::collector::queries::{
@@ -89,12 +89,20 @@ pub enum CollectorEvent {
         action: Action,
         outcome: ActionOutcome,
     },
+    /// A plan, or the reason there is not one. The key identifies the
+    /// statement it belongs to, so a result arriving after the user has moved
+    /// on can be discarded rather than shown against the wrong query.
+    ExplainFinished {
+        key: StatementKey,
+        result: Result<String, CollectorError>,
+    },
 }
 
 pub struct CollectorHandle {
     pub events: async_channel::Receiver<CollectorEvent>,
     stop: async_channel::Sender<()>,
     commands: async_channel::Sender<Action>,
+    explains: async_channel::Sender<(StatementKey, String)>,
 }
 
 impl CollectorHandle {
@@ -107,6 +115,13 @@ impl CollectorHandle {
     /// the caller must say so rather than let the user believe it ran.
     pub fn submit(&self, action: Action) -> bool {
         offer_command(&self.commands, action)
+    }
+
+    /// Offers an explain request. False means it was not accepted, and the
+    /// caller must say so rather than leave the user waiting for a plan that
+    /// is never coming.
+    pub fn explain(&self, key: StatementKey, sql: String) -> bool {
+        self.explains.try_send((key, sql)).is_ok()
     }
 }
 
@@ -284,6 +299,10 @@ pub fn spawn(
     // Eight is far more than a human clicking buttons can produce; a full
     // channel means something is wrong, and refusing is the right answer.
     let (command_tx, command_rx) = async_channel::bounded(8);
+    // Explain requests are equally hand-driven, and a queue of stale ones is
+    // worth even less: by the time an old plan arrives the user has asked for
+    // another.
+    let (explain_tx, explain_rx) = async_channel::bounded(4);
 
     std::thread::Builder::new()
         .name("mcpg-collector".to_string())
@@ -292,7 +311,9 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("failed to build the collector runtime");
-            runtime.block_on(run(params, password, config, event_tx, stop_rx, command_rx));
+            runtime.block_on(run(
+                params, password, config, event_tx, stop_rx, command_rx, explain_rx,
+            ));
         })
         .expect("failed to spawn the collector thread");
 
@@ -300,6 +321,7 @@ pub fn spawn(
         events: event_rx,
         stop: stop_tx,
         commands: command_tx,
+        explains: explain_tx,
     }
 }
 
@@ -310,6 +332,7 @@ async fn run(
     events: async_channel::Sender<CollectorEvent>,
     stop: async_channel::Receiver<()>,
     commands: async_channel::Receiver<Action>,
+    explains: async_channel::Receiver<(StatementKey, String)>,
 ) {
     let mut consecutive_failures = 0u32;
     let mut history_preloaded = false;
@@ -370,6 +393,7 @@ async fn run(
                     &events,
                     &stop,
                     &commands,
+                    &explains,
                 )
                 .await
                 {
@@ -512,6 +536,7 @@ async fn sample_loop(
     events: &async_channel::Sender<CollectorEvent>,
     stop: &async_channel::Receiver<()>,
     commands: &async_channel::Receiver<Action>,
+    explains: &async_channel::Receiver<(StatementKey, String)>,
 ) -> Exit {
     let mut previous: Option<(DatabaseCounters, Instant)> = None;
     let mut previous_statements: Option<(HashMap<StatementKey, StatementCounters>, Instant)> = None;
@@ -625,6 +650,10 @@ async fn sample_loop(
                     // `stop` reports.
                     Err(_) => return Exit::Stopped,
                 },
+                request = explains.recv() => match request {
+                    Ok((key, sql)) => spawn_explain(params, password, key, sql, events),
+                    Err(_) => return Exit::Stopped,
+                },
             }
         }
     }
@@ -654,6 +683,29 @@ fn spawn_action(
         let outcome = run_action(&params, &password, &action).await;
         let _ = events
             .send(CollectorEvent::ActionFinished { action, outcome })
+            .await;
+    });
+}
+
+/// Runs one explain off the sampling path, in the manner of `spawn_action`.
+///
+/// The key travels with the result so the window can tell a plan for the
+/// statement still selected from one the user has since navigated away from.
+fn spawn_explain(
+    params: &ConnectionParams,
+    password: &str,
+    key: StatementKey,
+    sql: String,
+    events: &async_channel::Sender<CollectorEvent>,
+) {
+    let params = params.clone();
+    let password = password.to_string();
+    let events = events.clone();
+
+    tokio::spawn(async move {
+        let result = run_explain(&params, &password, &sql).await;
+        let _ = events
+            .send(CollectorEvent::ExplainFinished { key, result })
             .await;
     });
 }

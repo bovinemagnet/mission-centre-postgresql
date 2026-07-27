@@ -35,9 +35,10 @@ use mission_centre_pg::connection::params::{ConnectionParams, HistoryMode};
 use mission_centre_pg::connection::probe::Capabilities;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
+use mission_centre_pg::explain::parse_plan;
 use mission_centre_pg::pages::{
-    McpgLocksPage, McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgReplicationPage,
-    McpgSessionsPage,
+    McpgLocksPage, McpgOverviewPage, McpgPlanPage, McpgQueriesPage, McpgRelationsPage,
+    McpgReplicationPage, McpgSessionsPage,
 };
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
@@ -71,6 +72,8 @@ mod imp {
         pub relations_page: TemplateChild<McpgRelationsPage>,
         #[template_child]
         pub locks_page: TemplateChild<McpgLocksPage>,
+        #[template_child]
+        pub plan_page: TemplateChild<McpgPlanPage>,
         #[template_child]
         pub replication_page: TemplateChild<McpgReplicationPage>,
         #[template_child]
@@ -121,6 +124,7 @@ mod imp {
             McpgQueriesPage::ensure_type();
             McpgRelationsPage::ensure_type();
             McpgLocksPage::ensure_type();
+            McpgPlanPage::ensure_type();
             McpgReplicationPage::ensure_type();
             klass.bind_template();
         }
@@ -347,6 +351,9 @@ impl MissionCentrePgWindow {
         // to the server just left, and are also refreshed only on the slow
         // tier.
         imp.relations_page.clear();
+        // A plan describes one server's statement; carrying it onto another
+        // would be a claim about the wrong database.
+        imp.plan_page.clear();
 
         let password = match credentials::fetch_password(&params.id) {
             Ok(password) => password.unwrap_or_default(),
@@ -424,6 +431,29 @@ impl MissionCentrePgWindow {
         let imp = self.imp();
 
         match event {
+            CollectorEvent::ExplainFinished { key, result } => {
+                // A plan for a statement the user has since moved away from
+                // describes something they are no longer looking at, so it is
+                // discarded rather than shown under the wrong query.
+                if imp.plan_page.pending_key().as_ref() != Some(&key) {
+                    return;
+                }
+                match result {
+                    Ok(json) => match parse_plan(&json) {
+                        Ok(plan) => {
+                            let now = glib::DateTime::now_local()
+                                .ok()
+                                .and_then(|t| t.format("%H:%M:%S").ok())
+                                .map(|t| t.to_string())
+                                .unwrap_or_default();
+                            imp.plan_page.show_plan(&plan, &now);
+                            self.add_toast_text(&i18n("The plan is ready on the Plan page."));
+                        }
+                        Err(error) => imp.plan_page.show_error(&error.to_string()),
+                    },
+                    Err(error) => imp.plan_page.show_error(&error.to_string()),
+                }
+            }
             CollectorEvent::Connecting => {
                 imp.error_banner.set_revealed(false);
                 if let Some(row) = self.selected_row() {
@@ -458,6 +488,9 @@ impl MissionCentrePgWindow {
                 imp.replication_page
                     .set_database(&imp.connected_database.borrow());
                 imp.replication_page.set_version(info.version_num);
+                // The Plan page needs it too: a server below 16 cannot explain a
+                // captured statement at all.
+                imp.plan_page.set_version(info.version_num);
                 self.set_capabilities(Some(info.capabilities));
 
                 if info.is_below_floor() {

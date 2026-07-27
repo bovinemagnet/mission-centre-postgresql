@@ -89,10 +89,12 @@ fn dropping_the_handle_sends_a_stop_signal_before_closing_the_channel() {
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
     let (_event_tx, event_rx) = async_channel::bounded::<CollectorEvent>(1);
     let (command_tx, _command_rx) = async_channel::bounded::<Action>(1);
+    let (explain_tx, _explain_rx) = async_channel::bounded::<(StatementKey, String)>(1);
     let handle = CollectorHandle {
         events: event_rx,
         stop: stop_tx,
         commands: command_tx,
+        explains: explain_tx,
     };
 
     drop(handle);

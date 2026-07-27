@@ -89,6 +89,13 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
           }
 
           Adw.ViewStackPage {
+            name: "plan";
+            title: _("Plan");
+            icon-name: "view-list-bullet-symbolic";
+            child: $McpgPlanPage plan_page {};
+          }
+
+          Adw.ViewStackPage {
             name: "locks";
             title: _("Locks");
             icon-name: "changes-prevent-symbolic";
