@@ -1,0 +1,123 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgPlanPage: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Box {
+    orientation: vertical;
+    margin-start: 12;
+    margin-end: 12;
+    margin-top: 12;
+    spacing: 2;
+
+    Gtk.Label statement_label {
+      xalign: 0;
+      ellipsize: end;
+      selectable: true;
+
+      styles ["monospace"]
+    }
+
+    Gtk.Label taken_at_label {
+      xalign: 0;
+
+      styles ["dim-label", "caption"]
+    }
+  }
+
+  Gtk.Stack state_stack {
+    vexpand: true;
+    margin-top: 6;
+
+    Gtk.StackPage {
+      name: "empty";
+
+      child: Adw.StatusPage {
+        icon-name: "view-list-bullet-symbolic";
+        title: _("No plan yet");
+        description: _("Right-click a statement on the Queries page and choose Explain query.");
+      };
+    }
+
+    Gtk.StackPage {
+      name: "unsupported";
+
+      child: Adw.StatusPage {
+        icon-name: "dialog-information-symbolic";
+        title: _("Explain plans are unavailable");
+        description: _("Explaining a captured statement needs EXPLAIN (GENERIC_PLAN), which requires PostgreSQL 16 or later. Captured statements have their literals replaced by placeholders, so they cannot be planned without it.");
+      };
+    }
+
+    Gtk.StackPage {
+      name: "failed";
+
+      child: Adw.StatusPage failed_page {
+        icon-name: "dialog-warning-symbolic";
+        title: _("The plan could not be produced");
+      };
+    }
+
+    Gtk.StackPage {
+      name: "pending";
+
+      child: Adw.StatusPage {
+        icon-name: "content-loading-symbolic";
+        title: _("Asking the server for a plan…");
+      };
+    }
+
+    Gtk.StackPage {
+      name: "plan";
+
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.Box {
+          halign: center;
+          margin-bottom: 6;
+
+          Adw.ViewSwitcher {
+            stack: view_stack;
+            policy: wide;
+          }
+        }
+
+        Adw.ViewStack view_stack {
+          vexpand: true;
+
+          Adw.ViewStackPage {
+            name: "tree";
+            title: _("Tree");
+
+            child: Gtk.ScrolledWindow {
+              vexpand: true;
+
+              child: Gtk.ColumnView tree_view {
+                show-column-separators: true;
+                reorderable: false;
+              };
+            };
+          }
+
+          Adw.ViewStackPage {
+            name: "text";
+            title: _("Text");
+
+            child: Gtk.ScrolledWindow {
+              vexpand: true;
+
+              child: Gtk.TextView text_view {
+                editable: false;
+                monospace: true;
+                left-margin: 12;
+                top-margin: 12;
+              };
+            };
+          }
+        }
+      };
+    }
+  }
+}

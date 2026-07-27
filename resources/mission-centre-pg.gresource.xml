@@ -9,6 +9,7 @@
     <file preprocess="xml-stripblanks">ui/queries_page.ui</file>
     <file preprocess="xml-stripblanks">ui/relations_page.ui</file>
     <file preprocess="xml-stripblanks">ui/locks_page.ui</file>
+    <file preprocess="xml-stripblanks">ui/plan_page.ui</file>
     <file preprocess="xml-stripblanks">ui/replication_page.ui</file>
   </gresource>
 </gresources>
