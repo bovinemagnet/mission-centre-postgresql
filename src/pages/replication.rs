@@ -19,6 +19,7 @@
  */
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -34,6 +35,16 @@ use crate::table::{Column, Table};
 /// against containers rather than recalled: `conflicting` arrives in 16, but
 /// `inactive_since` not until 17.
 const INACTIVE_SINCE_VERSION: i32 = 170000;
+
+/// The connected server's version, for the one column whose rendering depends
+/// on it.
+///
+/// `Column::render` is a plain function pointer, not a closure, so it cannot
+/// capture the page. A process-wide value is sound here because the window
+/// samples one server at a time, and it is rewritten on every connect. The
+/// alternative — making `Renderer<T>` a boxed closure — would change the
+/// shared table widget for every page to serve one column.
+static SERVER_VERSION: AtomicI32 = AtomicI32::new(0);
 
 /// What the inactive-duration cell shows. A server too old to report it is a
 /// different thing from a slot that is currently active, and neither may
@@ -361,6 +372,14 @@ static SLOT_COLUMNS: &[Column<Slot>] = &[
         sort_key: Some(|slot| slot.safe_wal_size.unwrap_or(0) as f64),
         expand: false,
     },
+    Column {
+        title: "Inactive",
+        render: |slot| inactive_cell(slot, SERVER_VERSION.load(Ordering::Relaxed)),
+        // An abandoned slot sorts to the top by duration as well as by the
+        // default order, so the longest-abandoned is the most prominent.
+        sort_key: Some(|slot| slot.inactive_since_secs.unwrap_or(0.0)),
+        expand: false,
+    },
 ];
 
 impl McpgReplicationPage {
@@ -381,6 +400,7 @@ impl McpgReplicationPage {
 
     pub fn set_version(&self, version_num: i32) {
         self.imp().version_num.set(version_num);
+        SERVER_VERSION.store(version_num, Ordering::Relaxed);
     }
 
     pub fn update(&self, replication: Option<&Result<ReplicationSample, CollectorError>>) {
@@ -542,6 +562,21 @@ mod tests {
         let sample = ReplicationSample::default();
         assert!(visible_sections(&sample).contains(&"slots"));
         assert!(!visible_sections(&sample).contains(&"logical"));
+    }
+
+    #[test]
+    fn the_inactive_column_renders_through_the_version_gate() {
+        let render = SLOT_COLUMNS
+            .iter()
+            .find(|column| column.title == "Inactive")
+            .expect("the Inactive column exists")
+            .render;
+
+        SERVER_VERSION.store(140000, Ordering::Relaxed);
+        assert_eq!(render(&slot(Some(90.0))), "—");
+
+        SERVER_VERSION.store(180000, Ordering::Relaxed);
+        assert_eq!(render(&slot(Some(90.0))), "2m");
     }
 
     #[test]
