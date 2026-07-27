@@ -33,9 +33,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::actions::{Action, ActionOutcome};
 use crate::collector::action_runner::run_action;
 use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
-use crate::collector::locks::{
-    map_lock_entry, map_participant, LockInventorySample, LocksSample, BLOCKED_SQL, INVENTORY_SQL,
-};
+use crate::collector::locks::{sample_lock_inventory, sample_locks};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -710,13 +708,7 @@ async fn sample(
     // tier. `classify_slow` keeps a permission or query error to the one page,
     // while a timeout or lost connection still fails the whole sample.
     let locks = Some(classify_slow(
-        client
-            .query(BLOCKED_SQL, &[])
-            .await
-            .map_err(map_query_error)
-            .map(|rows| LocksSample {
-                participants: rows.iter().map(map_participant).collect(),
-            }),
+        sample_locks(client).await.map_err(map_query_error),
     )?);
 
     // `None` means the inventory view is not on screen, which the page renders
@@ -724,14 +716,9 @@ async fn sample(
     let lock_inventory = match inventory_limit {
         None => None,
         Some(limit) => Some(classify_slow(
-            client
-                .query(INVENTORY_SQL, &[&limit])
+            sample_lock_inventory(client, limit)
                 .await
-                .map_err(map_query_error)
-                .map(|rows| LockInventorySample {
-                    total: rows.first().map(|row| row.get("total")).unwrap_or(0),
-                    locks: rows.iter().map(map_lock_entry).collect(),
-                }),
+                .map_err(map_query_error),
         )?),
     };
 

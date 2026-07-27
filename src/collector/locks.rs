@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tokio_postgres::Row;
+use tokio_postgres::{Client, Row};
 
 /// One backend involved in a lock conflict — either waiting, or blocking
 /// somebody who is.
@@ -118,6 +118,28 @@ LEFT JOIN LATERAL (
     WHERE l.pid = p.pid AND NOT l.granted
     LIMIT 1
 ) lk ON true";
+
+/// Runs the blocked-tree query and maps its rows. Lives here rather than in
+/// the worker so the lock queries and their row types stay together.
+pub async fn sample_locks(client: &Client) -> Result<LocksSample, tokio_postgres::Error> {
+    let rows = client.query(BLOCKED_SQL, &[]).await?;
+    Ok(LocksSample {
+        participants: rows.iter().map(map_participant).collect(),
+    })
+}
+
+/// Runs the inventory query at the given limit, carrying back the untruncated
+/// total the same pass reports.
+pub async fn sample_lock_inventory(
+    client: &Client,
+    limit: i64,
+) -> Result<LockInventorySample, tokio_postgres::Error> {
+    let rows = client.query(INVENTORY_SQL, &[&limit]).await?;
+    Ok(LockInventorySample {
+        total: rows.first().map(|row| row.get("total")).unwrap_or(0),
+        locks: rows.iter().map(map_lock_entry).collect(),
+    })
+}
 
 /// One row of the full inventory: a lock as the server holds it, with its
 /// holder's identity where the role is allowed to see it.
