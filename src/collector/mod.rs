@@ -24,6 +24,7 @@ pub mod locks;
 pub mod queries;
 pub mod rates;
 pub mod relations;
+pub mod replication;
 pub mod snapshot;
 pub mod statements;
 pub mod worker;
