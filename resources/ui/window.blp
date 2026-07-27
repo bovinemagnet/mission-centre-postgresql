@@ -94,6 +94,13 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
             icon-name: "changes-prevent-symbolic";
             child: $McpgLocksPage locks_page {};
           }
+
+          Adw.ViewStackPage {
+            name: "replication";
+            title: _("Replication");
+            icon-name: "network-transmit-receive-symbolic";
+            child: $McpgReplicationPage replication_page {};
+          }
         };
       };
     };

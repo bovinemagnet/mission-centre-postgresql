@@ -36,7 +36,8 @@ use mission_centre_pg::connection::probe::Capabilities;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
-    McpgLocksPage, McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
+    McpgLocksPage, McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgReplicationPage,
+    McpgSessionsPage,
 };
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
@@ -70,6 +71,8 @@ mod imp {
         pub relations_page: TemplateChild<McpgRelationsPage>,
         #[template_child]
         pub locks_page: TemplateChild<McpgLocksPage>,
+        #[template_child]
+        pub replication_page: TemplateChild<McpgReplicationPage>,
         #[template_child]
         pub view_stack: TemplateChild<adw::ViewStack>,
 
@@ -118,6 +121,7 @@ mod imp {
             McpgQueriesPage::ensure_type();
             McpgRelationsPage::ensure_type();
             McpgLocksPage::ensure_type();
+            McpgReplicationPage::ensure_type();
             klass.bind_template();
         }
 
@@ -444,6 +448,12 @@ impl MissionCentrePgWindow {
                 );
                 imp.relations_page
                     .set_database(&imp.connected_database.borrow());
+                // The replication page needs both: publications are visible
+                // only for the connected database, and the slot columns
+                // depend on the server version.
+                imp.replication_page
+                    .set_database(&imp.connected_database.borrow());
+                imp.replication_page.set_version(info.version_num);
                 self.set_capabilities(Some(info.capabilities));
 
                 if info.is_below_floor() {
@@ -487,6 +497,9 @@ impl MissionCentrePgWindow {
                 imp.locks_page.update(snapshot.locks.as_ref());
                 imp.locks_page
                     .update_inventory(snapshot.lock_inventory.as_ref());
+                // Slow tier: None on a fast tick, and the page keeps what it
+                // has rather than blanking between slow samples.
+                imp.replication_page.update(snapshot.replication.as_ref());
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);
