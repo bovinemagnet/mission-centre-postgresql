@@ -36,6 +36,7 @@ use mission_centre_pg::collector::queries::{
 use mission_centre_pg::collector::relations::{
     map_index_stats, map_table_stats, tables_sql, INDEXES_SQL,
 };
+use mission_centre_pg::collector::replication::sample_replication;
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
 use mission_centre_pg::collector::statements::{
     apply_deltas, counters_by_key, map_statement, STATEMENTS_SQL,
@@ -890,4 +891,155 @@ async fn the_inventory_total_exceeds_the_limit_on_postgres_14() {
 #[tokio::test]
 async fn the_inventory_total_exceeds_the_limit_on_postgres_18() {
     assert_the_inventory_total_exceeds_the_limit("18").await;
+}
+
+/// Every replication query must run on both versions. A fresh server is a
+/// primary with no standbys, no slots and no subscriptions — the ordinary
+/// case, and one that must not be mistaken for a failure.
+async fn assert_replication_sample_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let sample = sample_replication(&client, version)
+        .await
+        .expect("the replication sample must run");
+
+    assert!(!sample.in_recovery, "a fresh container is a primary");
+    assert!(sample.standbys.is_empty());
+    assert!(sample.slots.is_empty());
+    assert!(sample.subscriptions.is_empty());
+    assert!(sample.receiver.is_none(), "a primary has no upstream");
+}
+
+#[tokio::test]
+async fn replication_sample_runs_on_postgres_14() {
+    assert_replication_sample_runs("14").await;
+}
+
+#[tokio::test]
+async fn replication_sample_runs_on_postgres_18() {
+    assert_replication_sample_runs("18").await;
+}
+
+/// A physical slot needs no standby to create, which gives a genuinely
+/// inactive slot to assert the sort rule against on a single container.
+async fn assert_an_inactive_slot_is_reported_and_sorted_first(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute(
+            "SELECT pg_create_physical_replication_slot('spare');
+             SELECT pg_create_physical_replication_slot('another')",
+        )
+        .await
+        .expect("failed to create the slots");
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let sample = sample_replication(&client, version)
+        .await
+        .expect("the replication sample must run");
+
+    assert_eq!(sample.slots.len(), 2);
+    assert!(
+        sample.slots.iter().all(|slot| !slot.active),
+        "a slot with no consumer is inactive: {:?}",
+        sample.slots
+    );
+    assert_eq!(
+        sample.slots[0].slot_name, "another",
+        "equally inactive slots sort by name"
+    );
+    assert_eq!(sample.slots[0].slot_type.as_deref(), Some("physical"));
+}
+
+#[tokio::test]
+async fn an_inactive_slot_is_reported_and_sorted_first_on_postgres_14() {
+    assert_an_inactive_slot_is_reported_and_sorted_first("14").await;
+}
+
+#[tokio::test]
+async fn an_inactive_slot_is_reported_and_sorted_first_on_postgres_18() {
+    assert_an_inactive_slot_is_reported_and_sorted_first("18").await;
+}
+
+/// The version boundary that an earlier draft of the spec got wrong:
+/// inactive_since is PostgreSQL 17, not 16. Before it, the sample must carry
+/// None rather than a fabricated zero.
+#[tokio::test]
+async fn the_inactive_duration_is_absent_before_postgres_17() {
+    let (client, _container) = connect("14").await;
+    client
+        .batch_execute("SELECT pg_create_physical_replication_slot('spare')")
+        .await
+        .expect("failed to create the slot");
+
+    let sample = sample_replication(&client, 140000)
+        .await
+        .expect("the replication sample must run");
+
+    assert_eq!(sample.slots[0].inactive_since_secs, None);
+    assert_eq!(sample.slots[0].conflicting, None);
+}
+
+#[tokio::test]
+async fn the_inactive_duration_is_reported_on_postgres_18() {
+    let (client, _container) = connect("18").await;
+    client
+        .batch_execute("SELECT pg_create_physical_replication_slot('spare')")
+        .await
+        .expect("failed to create the slot");
+
+    let sample = sample_replication(&client, 180000)
+        .await
+        .expect("the replication sample must run");
+
+    assert!(
+        sample.slots[0].inactive_since_secs.is_some(),
+        "PostgreSQL 17 and later report how long a slot has been inactive"
+    );
+    // `conflicting` stays NULL for a physical slot even where the column
+    // exists: it describes a logical slot invalidated by recovery conflict.
+    // The page must therefore treat None as "not applicable" rather than as
+    // "not conflicting".
+    assert_eq!(sample.slots[0].conflicting, None);
+}
+
+/// Settles the privilege question by observation for the replication views,
+/// as the lock tests do for pg_locks.
+async fn assert_replication_runs_for_a_plain_role(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the plain role");
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let plain = connect_as(&container, "plain", "plain").await;
+    sample_replication(&plain, version)
+        .await
+        .expect("a role without pg_monitor must still run the replication queries");
+}
+
+#[tokio::test]
+async fn replication_runs_for_a_plain_role_on_postgres_14() {
+    assert_replication_runs_for_a_plain_role("14").await;
+}
+
+#[tokio::test]
+async fn replication_runs_for_a_plain_role_on_postgres_18() {
+    assert_replication_runs_for_a_plain_role("18").await;
 }

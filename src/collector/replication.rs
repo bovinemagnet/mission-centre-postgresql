@@ -18,6 +18,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+use tokio_postgres::{Client, Row};
+
 /// A standby connected to this primary, from `pg_stat_replication`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Standby {
@@ -87,6 +89,41 @@ pub struct ReplicationSample {
     pub subscriptions: Vec<Subscription>,
     pub publications: Vec<Publication>,
 }
+
+/// Identical columns on 14 through 18, so no branch is needed. The byte
+/// distance is computed server-side: pg_lsn arithmetic has no client-side
+/// equivalent worth writing.
+pub const STANDBYS_SQL: &str = "\
+SELECT pid                                                 AS pid,
+       application_name::text                              AS application_name,
+       client_addr::text                                   AS client_addr,
+       state::text                                         AS state,
+       sync_state::text                                    AS sync_state,
+       EXTRACT(EPOCH FROM write_lag)::float8               AS write_lag_secs,
+       EXTRACT(EPOCH FROM flush_lag)::float8               AS flush_lag_secs,
+       EXTRACT(EPOCH FROM replay_lag)::float8              AS replay_lag_secs,
+       (sent_lsn - replay_lsn)::bigint                     AS replay_lag_bytes
+FROM pg_stat_replication";
+
+/// Only ever returns a row on a standby.
+pub const RECEIVER_SQL: &str = "\
+SELECT status::text                                        AS status,
+       sender_host::text                                   AS sender_host,
+       latest_end_lsn::text                                AS received_lsn,
+       pg_last_wal_replay_lsn()::text                      AS replayed_lsn,
+       EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::float8
+                                                           AS replay_delay_secs
+FROM pg_stat_wal_receiver";
+
+/// Publications belong to the connected database only — `pg_publication` is
+/// not a shared catalogue, unlike `pg_subscription` — which the page states
+/// rather than implying the server has none.
+pub const PUBLICATIONS_SQL: &str = "\
+SELECT pubname::text AS pubname, puballtables AS all_tables
+FROM pg_publication
+ORDER BY pubname";
+
+pub const IN_RECOVERY_SQL: &str = "SELECT pg_is_in_recovery() AS in_recovery";
 
 /// Slot columns arrive across three releases, so the query is built rather
 /// than branched wholesale: 16 adds `conflicting`, 17 adds `inactive_since`.
@@ -161,6 +198,128 @@ pub fn sort_slots(slots: &mut [Slot]) {
             .cmp(&b.active)
             .then_with(|| a.slot_name.cmp(&b.slot_name))
     });
+}
+
+pub fn map_standby(row: &Row) -> Standby {
+    Standby {
+        pid: row.get("pid"),
+        application_name: row.get("application_name"),
+        client_addr: row.get("client_addr"),
+        state: row.get("state"),
+        sync_state: row.get("sync_state"),
+        write_lag_secs: row.get("write_lag_secs"),
+        flush_lag_secs: row.get("flush_lag_secs"),
+        replay_lag_secs: row.get("replay_lag_secs"),
+        replay_lag_bytes: row.get("replay_lag_bytes"),
+    }
+}
+
+pub fn map_slot(row: &Row) -> Slot {
+    Slot {
+        slot_name: row.get("slot_name"),
+        slot_type: row.get("slot_type"),
+        plugin: row.get("plugin"),
+        database: row.get("database"),
+        active: row.get("active"),
+        wal_status: row.get("wal_status"),
+        safe_wal_size: row.get("safe_wal_size"),
+        inactive_since_secs: row.get("inactive_since_secs"),
+        conflicting: row.get("conflicting"),
+    }
+}
+
+pub fn map_subscription(row: &Row) -> Subscription {
+    Subscription {
+        subname: row.get("subname"),
+        pid: row.get("pid"),
+        worker_type: row.get("worker_type"),
+        latest_end_lag_secs: row.get("latest_end_lag_secs"),
+        apply_error_count: row.get("apply_error_count"),
+        sync_error_count: row.get("sync_error_count"),
+    }
+}
+
+pub fn map_publication(row: &Row) -> Publication {
+    Publication {
+        pubname: row.get("pubname"),
+        all_tables: row.get("all_tables"),
+    }
+}
+
+pub fn map_receiver(row: &Row) -> WalReceiver {
+    WalReceiver {
+        status: row.get("status"),
+        sender_host: row.get("sender_host"),
+        received_lsn: row.get("received_lsn"),
+        replayed_lsn: row.get("replayed_lsn"),
+        replay_delay_secs: row.get("replay_delay_secs"),
+    }
+}
+
+/// One slow-tier pass over every replication source. Nothing here fails just
+/// because a section is empty, which is the normal case on most servers.
+pub async fn sample_replication(
+    client: &Client,
+    version_num: i32,
+) -> Result<ReplicationSample, tokio_postgres::Error> {
+    let in_recovery: bool = client
+        .query_one(IN_RECOVERY_SQL, &[])
+        .await?
+        .get("in_recovery");
+
+    // A standby has no standbys of its own to report, and a primary has no
+    // receiver. Skipping the query that cannot apply keeps a slow tick short.
+    let standbys = if in_recovery {
+        Vec::new()
+    } else {
+        client
+            .query(STANDBYS_SQL, &[])
+            .await?
+            .iter()
+            .map(map_standby)
+            .collect()
+    };
+
+    let receiver = if in_recovery {
+        client
+            .query_opt(RECEIVER_SQL, &[])
+            .await?
+            .as_ref()
+            .map(map_receiver)
+    } else {
+        None
+    };
+
+    let mut slots: Vec<Slot> = client
+        .query(slots_sql(version_num).as_str(), &[])
+        .await?
+        .iter()
+        .map(map_slot)
+        .collect();
+    sort_slots(&mut slots);
+
+    let subscriptions = client
+        .query(subscriptions_sql(version_num).as_str(), &[])
+        .await?
+        .iter()
+        .map(map_subscription)
+        .collect();
+
+    let publications = client
+        .query(PUBLICATIONS_SQL, &[])
+        .await?
+        .iter()
+        .map(map_publication)
+        .collect();
+
+    Ok(ReplicationSample {
+        in_recovery,
+        standbys,
+        receiver,
+        slots,
+        subscriptions,
+        publications,
+    })
 }
 
 #[cfg(test)]
