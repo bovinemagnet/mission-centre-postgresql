@@ -11,6 +11,31 @@ rather than docker, so point the Docker API client at podman's socket:
 
 The tests pull `docker.io/library/postgres:14` and `:18` on first run.
 
+## Servers for the by-hand walkthroughs
+
+The integration tests need no setup: they start and remove their own
+containers. The success criteria in the phase plans do, because contention,
+a streaming standby and an unprivileged role are states a person has to look
+at. `tools/fixtures.sh` builds them:
+
+    tools/fixtures.sh statements   # pg_stat_statements and a captured join   :55436
+    tools/fixtures.sh locks        # a three-deep lock chain, held open       :55432
+    tools/fixtures.sh roles        # the postgres/watcher/app trio            :55437
+    tools/fixtures.sh standby      # a primary streaming to a standby  :55434 :55435
+    tools/fixtures.sh all
+    tools/fixtures.sh down
+
+Every server uses `postgres`/`postgres`. `IMAGE_TAG=15` selects another
+version, which is how the version-gated messages get checked; `HOLD_SECONDS`
+changes how long the lock chain is held.
+
+The script exists mainly to record the things that are easy to get wrong:
+PostgreSQL 18's image moved `PGDATA`, `pg_basebackup` needs a `replication`
+line in `pg_hba.conf` that `POSTGRES_HOST_AUTH_METHOD=trust` does not
+provide, `psql -U app` connects to a database named after the role unless
+told otherwise, and PostgreSQL 15 and later revoke `CREATE` on schema
+`public` from `PUBLIC`.
+
 ## Inspecting the running user interface
 
 `tools/uicheck.py` reads the running application over the accessibility bus.
