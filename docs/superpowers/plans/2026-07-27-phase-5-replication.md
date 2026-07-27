@@ -919,7 +919,7 @@ Beside the existing `imp.relations_page.set_database(...)` call in the `Connecte
 
 ```bash
 ninja -C build
-MCPG_RESOURCE_DIR=$PWD/build/resources GSETTINGS_SCHEMA_DIR=$PWD/data ./build/src/mission-centre-pg
+MCPG_RESOURCE_DIR=$PWD/build/resources GSETTINGS_SCHEMA_DIR=$PWD/build/data ./build/src/mission-centre-pg
 ```
 
 Expected: a Replication entry appears; against a plain container it shows an empty standbys section and an empty slots section, with no logical section at all.

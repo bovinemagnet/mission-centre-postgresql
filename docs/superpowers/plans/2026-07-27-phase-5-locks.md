@@ -889,7 +889,7 @@ Wherever `set_capabilities` is called for the sessions page, call it for the loc
 
 ```bash
 ninja -C build
-MCPG_RESOURCE_DIR=$PWD/build/resources GSETTINGS_SCHEMA_DIR=$PWD/data ./build/src/mission-centre-pg
+MCPG_RESOURCE_DIR=$PWD/build/resources GSETTINGS_SCHEMA_DIR=$PWD/build/data ./build/src/mission-centre-pg
 ```
 
 Expected: a Locks entry appears in the switcher, showing "No blocked sessions" against an idle server.
