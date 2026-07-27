@@ -25,6 +25,7 @@ pub mod queries;
 pub mod relations;
 pub mod sessions;
 
+pub use locks::McpgLocksPage;
 pub use overview::McpgOverviewPage;
 pub use queries::McpgQueriesPage;
 pub use relations::McpgRelationsPage;

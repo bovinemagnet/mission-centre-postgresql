@@ -293,6 +293,7 @@ impl MissionCentrePgWindow {
 
         imp.sessions_page.set_capabilities(&capabilities);
         imp.relations_page.set_capabilities(&capabilities);
+        imp.locks_page.set_capabilities(&capabilities);
     }
 
     fn set_action_enabled(&self, name: &str, enabled: bool) {

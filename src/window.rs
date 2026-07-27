@@ -34,7 +34,7 @@ use mission_centre_pg::connection::probe::Capabilities;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
-    McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
+    McpgLocksPage, McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
 };
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
@@ -66,6 +66,8 @@ mod imp {
         pub queries_page: TemplateChild<McpgQueriesPage>,
         #[template_child]
         pub relations_page: TemplateChild<McpgRelationsPage>,
+        #[template_child]
+        pub locks_page: TemplateChild<McpgLocksPage>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -106,6 +108,7 @@ mod imp {
             McpgSessionsPage::ensure_type();
             McpgQueriesPage::ensure_type();
             McpgRelationsPage::ensure_type();
+            McpgLocksPage::ensure_type();
             klass.bind_template();
         }
 
@@ -460,6 +463,8 @@ impl MissionCentrePgWindow {
                     Some(Err(error)) => imp.relations_page.set_error(&i18n(&error.to_string())),
                     None => {}
                 }
+                // Locks ride the fast tier, so this is Some on every tick.
+                imp.locks_page.update(snapshot.locks.as_ref());
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);
