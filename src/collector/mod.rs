@@ -20,6 +20,7 @@
 
 pub mod action_runner;
 mod history_io;
+pub mod locks;
 pub mod queries;
 pub mod rates;
 pub mod relations;
