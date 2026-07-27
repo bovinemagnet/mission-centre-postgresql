@@ -22,6 +22,7 @@ pub mod actions;
 pub mod collector;
 pub mod connection;
 pub mod dialogs;
+pub mod explain;
 pub mod history;
 pub mod i18n;
 pub mod pages;
