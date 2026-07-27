@@ -2479,8 +2479,6 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
- "serde_core",
- "serde_json",
 ]
 
 [[package]]

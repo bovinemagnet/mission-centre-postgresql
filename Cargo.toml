@@ -19,12 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.53", features = ["rt", "time", "macros", "sync"] }
-tokio-postgres = { version = "0.7", features = [
-    "with-chrono-0_4",
-    # EXPLAIN (FORMAT JSON) returns a json column, which needs this feature to
-    # decode into serde_json::Value.
-    "with-serde_json-1",
-] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-postgres-rustls = "0.14"
 rustls = "0.23"
 rustls-native-certs = "0.8"

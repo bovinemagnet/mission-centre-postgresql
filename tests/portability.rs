@@ -44,6 +44,7 @@ use mission_centre_pg::collector::statements::{
 use mission_centre_pg::connection::probe::{
     map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
 };
+use mission_centre_pg::explain::{explain_sql, parse_plan};
 use mission_centre_pg::history::pgconsole::{
     map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
     PGCONSOLE_PROBE_SQL,
@@ -1042,4 +1043,134 @@ async fn replication_runs_for_a_plain_role_on_postgres_14() {
 #[tokio::test]
 async fn replication_runs_for_a_plain_role_on_postgres_18() {
     assert_replication_runs_for_a_plain_role("18").await;
+}
+
+/// The first column of the first row of a simple query, which is how the
+/// application reads a plan back.
+fn first_column(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> String {
+    messages
+        .into_iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .expect("expected a row")
+}
+
+/// The boundary the whole explain feature turns on. 15 is tested as well as
+/// 14, because the boundary sits between 15 and 16 and an off-by-one there
+/// would silently disable the feature on a supported server.
+async fn assert_generic_plan_is_refused(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, note text)")
+        .await
+        .expect("failed to create the table");
+
+    // simple_query, matching what the application does: the extended protocol
+    // would read the $1 inside the explained statement as a parameter of the
+    // call itself and fail before the server ever sees it.
+    let sql = explain_sql("SELECT * FROM t WHERE id = $1").expect("the statement is accepted");
+    let error = client
+        .simple_query(sql.as_str())
+        .await
+        .expect_err("a server below 16 must refuse this");
+
+    // Display for a tokio-postgres error is only "db error"; the server's
+    // words are in the DbError, which is the whole reason the application
+    // surfaces that rather than the wrapper (issue #6).
+    let message = error
+        .as_db_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| error.to_string());
+
+    assert!(
+        message.contains("parameter") || message.to_lowercase().contains("generic_plan"),
+        "unexpected refusal on {tag}: {message}"
+    );
+}
+
+#[tokio::test]
+async fn generic_plan_is_refused_on_postgres_14() {
+    assert_generic_plan_is_refused("14").await;
+}
+
+#[tokio::test]
+async fn generic_plan_is_refused_on_postgres_15() {
+    assert_generic_plan_is_refused("15").await;
+}
+
+async fn assert_generic_plan_is_accepted(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, note text)")
+        .await
+        .expect("failed to create the table");
+
+    let sql = explain_sql("SELECT * FROM t WHERE id = $1").expect("the statement is accepted");
+    let json = first_column(
+        client
+            .simple_query(sql.as_str())
+            .await
+            .expect("16 and later must accept this"),
+    );
+    let plan = parse_plan(&json).expect("the plan parses");
+    assert!(
+        plan.node_type.contains("Scan"),
+        "unexpected root node: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn generic_plan_is_accepted_on_postgres_16() {
+    assert_generic_plan_is_accepted("16").await;
+}
+
+#[tokio::test]
+async fn generic_plan_is_accepted_on_postgres_18() {
+    assert_generic_plan_is_accepted("18").await;
+}
+
+/// The round trip that matters: the text the page sends comes from the
+/// extension, normalised, rather than from a hand-written literal.
+#[tokio::test]
+async fn a_statement_from_pg_stat_statements_can_be_explained_on_postgres_18() {
+    let (client, _container) = connect_with_statements("18").await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, note text)")
+        .await
+        .expect("failed to create the table");
+    client
+        .execute("SELECT * FROM t WHERE id = $1", &[&1i32])
+        .await
+        .expect("failed to run a parameterised statement");
+
+    let recorded = wait_for(|| async {
+        client
+            .query_opt(
+                "SELECT query FROM pg_stat_statements WHERE query LIKE 'SELECT * FROM t%' LIMIT 1",
+                &[],
+            )
+            .await
+            .ok()
+            .flatten()
+    })
+    .await
+    .expect("the statement must be recorded");
+
+    let normalised: String = recorded.get("query");
+    assert!(
+        normalised.contains('$'),
+        "expected a normalised statement: {normalised}"
+    );
+
+    let sql = explain_sql(&normalised).expect("the recorded statement is accepted");
+    let json = first_column(
+        client
+            .simple_query(sql.as_str())
+            .await
+            .expect("a normalised statement explains with GENERIC_PLAN"),
+    );
+    let plan = parse_plan(&json).expect("the plan parses");
+    assert!(!plan.node_type.is_empty());
 }

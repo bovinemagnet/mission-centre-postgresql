@@ -20,6 +20,8 @@
 
 use crate::actions::sql::plan_for;
 use crate::actions::{signal_outcome, Action, ActionOutcome};
+use tokio_postgres::SimpleQueryMessage;
+
 use crate::collector::worker::{connect, map_query_error, CollectorError};
 use crate::connection::params::ConnectionParams;
 
@@ -92,9 +94,18 @@ pub async fn run_explain(
         .await
         .map_err(map_query_error)?;
 
-    // FORMAT JSON returns a single column of type json, not text; decoding it
-    // as a Value and converting keeps the parsing itself in src/explain.
-    let row = client.query_one(sql, &[]).await.map_err(map_query_error)?;
-    let plan: serde_json::Value = row.get(0);
-    Ok(plan.to_string())
+    // The simple query protocol, deliberately. Under the extended protocol the
+    // driver prepares the statement, reads the `$1` placeholders inside the
+    // statement being explained as parameters of its own, and refuses the call
+    // for passing none. psql succeeds for the same reason: it sends this
+    // simply. Values arrive as text, which is what the parser wants anyway.
+    let messages = client.simple_query(sql).await.map_err(map_query_error)?;
+
+    messages
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .ok_or_else(|| CollectorError::Query("the server returned no plan".to_string()))
 }
