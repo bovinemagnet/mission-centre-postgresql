@@ -1,0 +1,73 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgLocksPage: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Stack tree_stack {
+    vexpand: true;
+
+    Gtk.StackPage {
+      name: "empty";
+
+      child: Adw.StatusPage {
+        icon-name: "emblem-ok-symbolic";
+        title: _("No blocked sessions");
+        description: _("Nothing is waiting on a lock.");
+      };
+    }
+
+    Gtk.StackPage {
+      name: "tree";
+
+      child: Gtk.ScrolledWindow {
+        vexpand: true;
+
+        child: Gtk.ColumnView column_view {
+          show-column-separators: true;
+          reorderable: false;
+        };
+      };
+    }
+
+    Gtk.StackPage {
+      name: "unavailable";
+
+      child: Adw.StatusPage unavailable_page {
+        icon-name: "dialog-information-symbolic";
+        title: _("Locks unavailable");
+      };
+    }
+  }
+
+  Gtk.Box {
+    spacing: 6;
+    margin-start: 12;
+    margin-end: 12;
+    margin-top: 6;
+    margin-bottom: 12;
+
+    Gtk.Label signal_reason {
+      hexpand: true;
+      xalign: 0;
+      visible: false;
+      wrap: true;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button cancel_backend_button {
+      label: _("Cancel query");
+      tooltip-text: _("Ask the selected backend to abandon its current query");
+      action-name: "win.cancel-backend";
+    }
+
+    Gtk.Button terminate_backend_button {
+      label: _("Terminate");
+      tooltip-text: _("Close the selected backend's connection");
+      action-name: "win.terminate-backend";
+
+      styles ["destructive-action"]
+    }
+  }
+}

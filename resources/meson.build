@@ -8,6 +8,7 @@ blueprints = custom_target(
     'ui/sessions_page.blp',
     'ui/queries_page.blp',
     'ui/relations_page.blp',
+    'ui/locks_page.blp',
   ),
   output: '.',
   command: [blueprint_compiler, 'batch-compile', '@OUTPUT@', '@CURRENT_SOURCE_DIR@', '@INPUT@'],

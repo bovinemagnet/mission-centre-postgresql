@@ -19,6 +19,7 @@
  */
 
 pub mod format;
+pub mod locks;
 pub mod overview;
 pub mod queries;
 pub mod relations;
