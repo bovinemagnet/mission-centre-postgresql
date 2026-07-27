@@ -117,21 +117,24 @@ rather than given a query of their own; both are single-row and cheap.
 
 ### 3.2 Version matrix
 
-Verified empirically against `postgres:14` and `postgres:18` containers on 2026-07-27, not recalled:
+Verified empirically against `postgres:14`, `15`, `16`, `17` and `18` containers on 2026-07-27, not
+recalled. The intermediate versions matter: the slot columns arrive across three separate releases,
+and an earlier draft of this table wrongly placed `inactive_since` at 16 by extrapolating from the
+14-and-18 endpoints alone.
 
 | View | 14 | 18 | Consequence |
 |---|---|---|---|
 | `pg_stat_replication` | ✅ identical columns | ✅ | **no version branch needed** |
 | `pg_stat_wal_receiver` | ✅ | ✅ | none |
 | `pg_locks` | ✅ | ✅ | none |
-| `pg_replication_slots` | through `two_phase` | adds `two_phase_at`, `inactive_since`, `conflicting`, `invalidation_reason`, `failover`, `synced` | branch |
+| `pg_replication_slots` | through `two_phase` | adds `conflicting` (16), `inactive_since`, `invalidation_reason`, `failover`, `synced` (17), `two_phase_at` (18) | branch |
 | `pg_stat_subscription` | no `worker_type`, no `leader_pid` | both present | branch |
 | `pg_stat_subscription_stats` | **absent** | ✅ | whole section conditional |
 
 The slot query is written against the 14-era column set and extends it where the server is newer.
 `inactive_since` deserves particular note: it is the column that answers "how long has this slot been
 abandoned", which is the single most operationally useful fact about a slot, and it does not exist
-before 16. On such servers the column shows an em dash and the section states the requirement. It is
+before 17. On such servers the column shows an em dash and the section states the requirement. It is
 not left blank, because a blank cell reads as "zero" or "unknown to the tool" rather than "your
 server cannot report this".
 
@@ -252,7 +255,8 @@ LSN. Alongside it, `pg_last_xact_replay_timestamp()` gives the more immediately 
 ### 5.4 Slots — always
 
 Slot name, type, plugin, database, active flag, `wal_status`, and `safe_wal_size` where reported. On
-16 and later, how long an inactive slot has been inactive.
+17 and later, how long an inactive slot has been inactive; on 16 and later, whether it is conflicting
+with recovery.
 
 **Inactive slots sort above active ones.** A slot with no consumer retains WAL indefinitely, and the
 resulting disk exhaustion takes the server down. It is the one thing on this page that can cause an
@@ -324,7 +328,7 @@ Three failure states are distinguished on screen, because each demands a differe
 
 | State | Message | Example |
 |---|---|---|
-| Unsupported | names the version required | "Inactive duration requires PostgreSQL 16 or later" |
+| Unsupported | names the version required | "Inactive duration requires PostgreSQL 17 or later" |
 | Not permitted | names the privilege required | "Requires pg_monitor" |
 | Failed | the PostgreSQL message itself | "canceling statement due to lock timeout" |
 
