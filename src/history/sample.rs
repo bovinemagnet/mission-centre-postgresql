@@ -128,6 +128,7 @@ mod tests {
             relations: None,
             locks: None,
             lock_inventory: None,
+            replication: None,
         }
     }
 

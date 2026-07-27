@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use super::locks::{LockInventorySample, LocksSample};
 use super::relations::RelationsSample;
+use super::replication::ReplicationSample;
 use super::statements::StatementsSample;
 use super::worker::CollectorError;
 
@@ -150,4 +151,6 @@ pub struct Snapshot {
     /// `None` means the inventory view is not on screen and was not sampled —
     /// the resting state, not a failure.
     pub lock_inventory: Option<Result<LockInventorySample, CollectorError>>,
+    /// Slow tier: `None` on a fast tick, and the page keeps what it has.
+    pub replication: Option<Result<ReplicationSample, CollectorError>>,
 }

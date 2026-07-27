@@ -42,6 +42,7 @@ use crate::collector::rates::derive_rates;
 use crate::collector::relations::{
     map_index_stats, map_table_stats, tables_sql, RelationsSample, INDEXES_SQL,
 };
+use crate::collector::replication::sample_replication;
 use crate::collector::snapshot::{DatabaseCounters, ServerSettings, Snapshot};
 use crate::collector::statements::{
     apply_deltas, counters_by_key, map_statement, StatementCounters, StatementKey,
@@ -722,8 +723,8 @@ async fn sample(
         )?),
     };
 
-    let (statements, relations) = match slow {
-        None => (None, None),
+    let (statements, relations, replication) = match slow {
+        None => (None, None, None),
         Some(slow) => {
             let statements = if slow.statements_available {
                 Some(classify_slow(
@@ -737,7 +738,12 @@ async fn sample(
             let relations = Some(classify_slow(
                 sample_relations(client, slow.relations_limit, slow.version_num).await,
             )?);
-            (statements, relations)
+            let replication = Some(classify_slow(
+                sample_replication(client, slow.version_num)
+                    .await
+                    .map_err(map_query_error),
+            )?);
+            (statements, relations, replication)
         }
     };
 
@@ -753,6 +759,7 @@ async fn sample(
         relations,
         locks,
         lock_inventory,
+        replication,
     })
 }
 
