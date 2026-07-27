@@ -2689,11 +2689,17 @@ Start a container with a superuser and a plain role:
 ```bash
 podman run --rm -d --name mcpg-phase4 -e POSTGRES_PASSWORD=postgres -p 55432:5432 docker.io/library/postgres:18 \
   -c shared_preload_libraries=pg_stat_statements
-sleep 3
+podman exec mcpg-phase4 bash -c 'until pg_isready -U postgres -q; do sleep 1; done'
 podman exec -i mcpg-phase4 psql -U postgres -c "CREATE EXTENSION pg_stat_statements"
 podman exec -i mcpg-phase4 psql -U postgres -c "CREATE ROLE app LOGIN PASSWORD 'app'"
 podman exec -i mcpg-phase4 psql -U postgres -c "CREATE ROLE watcher LOGIN PASSWORD 'watcher' IN ROLE pg_monitor"
-podman exec -i mcpg-phase4 psql -U app -h 127.0.0.1 -c "CREATE TABLE app_orders (id bigserial PRIMARY KEY, note text)"
+# PostgreSQL 15 and later revoke CREATE on schema public from PUBLIC, so app cannot
+# create its own table without this grant.
+podman exec -i mcpg-phase4 psql -U postgres -c "GRANT CREATE ON SCHEMA public TO app"
+# -d postgres is required: psql would otherwise connect to a database named after the
+# role, and no database called app exists.
+podman exec -i -e PGPASSWORD=app mcpg-phase4 psql -U app -h 127.0.0.1 -d postgres \
+  -c "CREATE TABLE app_orders (id bigserial PRIMARY KEY, note text)"
 ```
 
 Run the application:
