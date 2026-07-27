@@ -424,6 +424,9 @@ impl MissionCentrePgWindow {
         let imp = self.imp();
 
         match event {
+            // Wired to the Plan page in the task that adds it; until then a
+            // plan that arrives has nowhere to go.
+            CollectorEvent::ExplainFinished { .. } => {}
             CollectorEvent::Connecting => {
                 imp.error_banner.set_revealed(false);
                 if let Some(row) = self.selected_row() {

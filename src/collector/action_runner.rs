@@ -20,7 +20,7 @@
 
 use crate::actions::sql::plan_for;
 use crate::actions::{signal_outcome, Action, ActionOutcome};
-use crate::collector::worker::{connect, map_query_error};
+use crate::collector::worker::{connect, map_query_error, CollectorError};
 use crate::connection::params::ConnectionParams;
 
 /// Runs one action on a connection of its own.
@@ -71,4 +71,30 @@ pub async fn run_action(
             Err(e) => ActionOutcome::Failed(map_query_error(e).to_string()),
         }
     }
+}
+
+/// Runs one `EXPLAIN` on a connection of its own and returns the plan as JSON.
+///
+/// Its own connection for the same reason an action has one: an EXPLAIN
+/// against a large catalogue can outlast a sampling interval, and the sampler
+/// must not be queued behind it. A failure here is returned to the caller
+/// rather than counted against the connection's failure budget — a statement
+/// that cannot be planned says nothing about the health of the connection.
+pub async fn run_explain(
+    params: &ConnectionParams,
+    password: &str,
+    sql: &str,
+) -> Result<String, CollectorError> {
+    let (client, _info) = connect(params, password).await?;
+
+    client
+        .batch_execute("SET statement_timeout = '5s'")
+        .await
+        .map_err(map_query_error)?;
+
+    // FORMAT JSON returns a single column of type json, not text; decoding it
+    // as a Value and converting keeps the parsing itself in src/explain.
+    let row = client.query_one(sql, &[]).await.map_err(map_query_error)?;
+    let plan: serde_json::Value = row.get(0);
+    Ok(plan.to_string())
 }
