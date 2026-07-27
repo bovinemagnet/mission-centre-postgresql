@@ -119,6 +119,57 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) lk ON true";
 
+/// One row of the full inventory: a lock as the server holds it, with its
+/// holder's identity where the role is allowed to see it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockEntry {
+    pub pid: Option<i32>,
+    pub lock_type: Option<String>,
+    pub mode: Option<String>,
+    pub granted: bool,
+    pub relation: Option<String>,
+    pub user_name: Option<String>,
+    pub database: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockInventorySample {
+    pub locks: Vec<LockEntry>,
+    /// Every lock the server holds, counted before the limit applies, so the
+    /// page can say "showing 500 of 4,312" rather than truncating silently.
+    pub total: i64,
+}
+
+/// Every lock, ungranted first so contention sorts to the top.
+///
+/// `count(*) OVER ()` returns the untruncated total in the same pass, which
+/// avoids a second query that could disagree with the first.
+pub const INVENTORY_SQL: &str = "\
+SELECT l.pid                            AS pid,
+       l.locktype::text                 AS lock_type,
+       l.mode                           AS mode,
+       coalesce(l.granted, false)       AS granted,
+       l.relation::regclass::text       AS relation,
+       a.usename::text                  AS user_name,
+       a.datname::text                  AS database,
+       count(*) OVER ()                 AS total
+FROM pg_locks l
+LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+ORDER BY l.granted, l.pid
+LIMIT $1";
+
+pub fn map_lock_entry(row: &Row) -> LockEntry {
+    LockEntry {
+        pid: row.get("pid"),
+        lock_type: row.get("lock_type"),
+        mode: row.get("mode"),
+        granted: row.get("granted"),
+        relation: row.get("relation"),
+        user_name: row.get("user_name"),
+        database: row.get("database"),
+    }
+}
+
 pub fn map_participant(row: &Row) -> LockParticipant {
     LockParticipant {
         pid: row.get("pid"),

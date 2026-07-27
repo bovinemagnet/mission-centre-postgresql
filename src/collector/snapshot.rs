@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use super::locks::LocksSample;
+use super::locks::{LockInventorySample, LocksSample};
 use super::relations::RelationsSample;
 use super::statements::StatementsSample;
 use super::worker::CollectorError;
@@ -147,4 +147,7 @@ pub struct Snapshot {
     /// Fast tier, so `Some` on every tick. `Err` carries the reason the page
     /// renders in place of its tree.
     pub locks: Option<Result<LocksSample, CollectorError>>,
+    /// `None` means the inventory view is not on screen and was not sampled —
+    /// the resting state, not a failure.
+    pub lock_inventory: Option<Result<LockInventorySample, CollectorError>>,
 }

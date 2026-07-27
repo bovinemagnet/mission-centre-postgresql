@@ -127,6 +127,7 @@ mod tests {
             statements: None,
             relations: None,
             locks: None,
+            lock_inventory: None,
         }
     }
 

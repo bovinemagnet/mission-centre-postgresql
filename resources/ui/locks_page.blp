@@ -4,38 +4,86 @@ using Adw 1;
 template $McpgLocksPage: Gtk.Box {
   orientation: vertical;
 
-  Gtk.Stack tree_stack {
+  Gtk.Box {
+    halign: center;
+    margin-top: 6;
+    margin-bottom: 6;
+
+    Adw.ViewSwitcher {
+      stack: view_stack;
+      policy: wide;
+    }
+  }
+
+  Adw.ViewStack view_stack {
     vexpand: true;
 
-    Gtk.StackPage {
-      name: "empty";
-
-      child: Adw.StatusPage {
-        icon-name: "emblem-ok-symbolic";
-        title: _("No blocked sessions");
-        description: _("Nothing is waiting on a lock.");
-      };
-    }
-
-    Gtk.StackPage {
+    Adw.ViewStackPage {
       name: "tree";
+      title: _("Blocked Sessions");
 
-      child: Gtk.ScrolledWindow {
+      child: Gtk.Stack tree_stack {
         vexpand: true;
 
-        child: Gtk.ColumnView column_view {
-          show-column-separators: true;
-          reorderable: false;
-        };
+        Gtk.StackPage {
+          name: "empty";
+
+          child: Adw.StatusPage {
+            icon-name: "emblem-ok-symbolic";
+            title: _("No blocked sessions");
+            description: _("Nothing is waiting on a lock.");
+          };
+        }
+
+        Gtk.StackPage {
+          name: "tree";
+
+          child: Gtk.ScrolledWindow {
+            vexpand: true;
+
+            child: Gtk.ColumnView column_view {
+              show-column-separators: true;
+              reorderable: false;
+            };
+          };
+        }
+
+        Gtk.StackPage {
+          name: "unavailable";
+
+          child: Adw.StatusPage unavailable_page {
+            icon-name: "dialog-information-symbolic";
+            title: _("Locks unavailable");
+          };
+        }
       };
     }
 
-    Gtk.StackPage {
-      name: "unavailable";
+    Adw.ViewStackPage {
+      name: "inventory";
+      title: _("All Locks");
 
-      child: Adw.StatusPage unavailable_page {
-        icon-name: "dialog-information-symbolic";
-        title: _("Locks unavailable");
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.ScrolledWindow {
+          vexpand: true;
+
+          child: Gtk.ColumnView inventory_view {
+            show-column-separators: true;
+            reorderable: false;
+          };
+        }
+
+        Gtk.Label truncation_label {
+          xalign: 0;
+          visible: false;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 6;
+
+          styles ["dim-label", "caption"]
+        }
       };
     }
   }

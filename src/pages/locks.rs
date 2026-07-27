@@ -24,7 +24,9 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 
-use crate::collector::locks::{build_forest, LockNode, LockParticipant, LocksSample};
+use crate::collector::locks::{
+    build_forest, LockEntry, LockInventorySample, LockNode, LockParticipant, LocksSample,
+};
 use crate::collector::worker::CollectorError;
 use crate::connection::probe::Capabilities;
 use crate::i18n::i18n;
@@ -149,6 +151,72 @@ fn lock_key(row: &LockRow) -> String {
     format!("{}:{}", row.depth, row.participant.pid)
 }
 
+const INVENTORY_COLUMNS: &[Column<LockEntry>] = &[
+    Column {
+        title: "PID",
+        render: |entry| entry.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+        sort_key: Some(|entry| entry.pid.unwrap_or(0) as f64),
+        expand: false,
+    },
+    Column {
+        title: "Type",
+        render: |entry| entry.lock_type.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Mode",
+        render: |entry| entry.mode.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Granted",
+        render: |entry| {
+            if entry.granted {
+                "yes".to_string()
+            } else {
+                "waiting".to_string()
+            }
+        },
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Object",
+        render: |entry| entry.relation.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: true,
+    },
+    Column {
+        title: "User",
+        render: |entry| entry.user_name.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+    Column {
+        title: "Database",
+        render: |entry| entry.database.clone().unwrap_or_default(),
+        sort_key: None,
+        expand: false,
+    },
+];
+
+fn inventory_key(entry: &LockEntry) -> String {
+    format!(
+        "{}:{}:{}",
+        entry.pid.unwrap_or(0),
+        entry.lock_type.as_deref().unwrap_or(""),
+        entry.relation.as_deref().unwrap_or("")
+    )
+}
+
+/// The truncation notice, or `None` when the whole inventory is on screen.
+/// Pure so the wording can be asserted without a live server.
+pub fn truncation_notice(shown: usize, total: i64) -> Option<String> {
+    (total > shown as i64).then(|| format!("Showing {shown} of {total} locks"))
+}
+
 mod imp {
     use super::*;
 
@@ -156,9 +224,15 @@ mod imp {
     #[template(resource = "/io/github/paulsnow/MissionCentrePg/ui/locks_page.ui")]
     pub struct McpgLocksPage {
         #[template_child]
+        pub view_stack: TemplateChild<adw::ViewStack>,
+        #[template_child]
         pub tree_stack: TemplateChild<gtk::Stack>,
         #[template_child]
         pub column_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub inventory_view: TemplateChild<gtk::ColumnView>,
+        #[template_child]
+        pub truncation_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub unavailable_page: TemplateChild<adw::StatusPage>,
         #[template_child]
@@ -169,6 +243,7 @@ mod imp {
         pub terminate_backend_button: TemplateChild<gtk::Button>,
 
         pub table: RefCell<Option<Table<LockRow>>>,
+        pub inventory_table: RefCell<Option<Table<LockEntry>>>,
     }
 
     #[glib::object_subclass]
@@ -192,6 +267,14 @@ mod imp {
 
             let table = Table::attach(&self.column_view.get(), COLUMNS, |_| true, lock_key);
             self.table.replace(Some(table));
+
+            let inventory = Table::attach(
+                &self.inventory_view.get(),
+                INVENTORY_COLUMNS,
+                |_| true,
+                inventory_key,
+            );
+            self.inventory_table.replace(Some(inventory));
         }
     }
 
@@ -225,6 +308,48 @@ impl McpgLocksPage {
     pub fn connect_selection_changed(&self, f: impl Fn() + 'static) {
         if let Some(table) = self.imp().table.borrow().as_ref() {
             table.connect_selection_changed(f);
+        }
+    }
+
+    /// Reports whether the inventory view is on screen, both now and whenever
+    /// it changes. The collector uses this to decide whether to run the
+    /// expensive inventory query at all.
+    pub fn connect_inventory_visibility(&self, f: impl Fn(bool) + 'static) {
+        let stack = self.imp().view_stack.get();
+        f(stack.visible_child_name().as_deref() == Some("inventory"));
+        stack.connect_visible_child_name_notify(move |stack| {
+            f(stack.visible_child_name().as_deref() == Some("inventory"));
+        });
+    }
+
+    /// `None` means the view is not on screen and nothing was sampled, which
+    /// leaves the table as it was rather than reporting a failure.
+    pub fn update_inventory(
+        &self,
+        inventory: Option<&Result<LockInventorySample, CollectorError>>,
+    ) {
+        let imp = self.imp();
+
+        let sample = match inventory {
+            None => return,
+            Some(Err(error)) => {
+                imp.truncation_label.set_text(&i18n(&error.to_string()));
+                imp.truncation_label.set_visible(true);
+                return;
+            }
+            Some(Ok(sample)) => sample,
+        };
+
+        if let Some(table) = imp.inventory_table.borrow().as_ref() {
+            table.update(&sample.locks);
+        }
+
+        match truncation_notice(sample.locks.len(), sample.total) {
+            Some(notice) => {
+                imp.truncation_label.set_text(&i18n(&notice));
+                imp.truncation_label.set_visible(true);
+            }
+            None => imp.truncation_label.set_visible(false),
         }
     }
 
@@ -338,6 +463,20 @@ mod tests {
         let rows = flatten(&forest);
 
         assert!(rows.iter().all(|row| !actions_available(row, false)));
+    }
+
+    #[test]
+    fn the_whole_inventory_needs_no_truncation_notice() {
+        assert_eq!(truncation_notice(500, 500), None);
+        assert_eq!(truncation_notice(12, 12), None);
+    }
+
+    #[test]
+    fn a_truncated_inventory_says_how_much_it_is_hiding() {
+        assert_eq!(
+            truncation_notice(500, 4312).as_deref(),
+            Some("Showing 500 of 4312 locks")
+        );
     }
 
     #[test]

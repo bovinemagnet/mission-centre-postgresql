@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use mission_centre_pg::actions::sql::plan_for;
 use mission_centre_pg::actions::{Action, MaintenanceKind};
-use mission_centre_pg::collector::locks::{build_forest, map_participant, BLOCKED_SQL};
+use mission_centre_pg::collector::locks::{
+    build_forest, map_lock_entry, map_participant, BLOCKED_SQL, INVENTORY_SQL,
+};
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -829,4 +831,63 @@ async fn blocked_sql_runs_for_a_plain_role_on_postgres_14() {
 #[tokio::test]
 async fn blocked_sql_runs_for_a_plain_role_on_postgres_18() {
     assert_blocked_sql_runs_for_a_plain_role("18").await;
+}
+
+/// The inventory must run on both versions, and never comes back empty: the
+/// querying backend holds locks of its own while it runs.
+async fn assert_inventory_sql_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(INVENTORY_SQL, &[&500i64])
+        .await
+        .expect("the lock inventory query must run");
+
+    assert!(
+        !rows.is_empty(),
+        "the querying backend holds locks of its own"
+    );
+    let entries: Vec<_> = rows.iter().map(map_lock_entry).collect();
+    assert!(
+        entries.iter().all(|entry| entry.mode.is_some()),
+        "every lock has a mode: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn inventory_sql_runs_on_postgres_14() {
+    assert_inventory_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn inventory_sql_runs_on_postgres_18() {
+    assert_inventory_sql_runs("18").await;
+}
+
+/// The total counts past the limit, which is what lets the page report
+/// truncation rather than implying the short list is the whole story.
+async fn assert_the_inventory_total_exceeds_the_limit(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(INVENTORY_SQL, &[&1i64])
+        .await
+        .expect("the lock inventory query must run");
+
+    assert_eq!(rows.len(), 1, "the limit is honoured");
+    let total: i64 = rows[0].get("total");
+    assert!(
+        total > 1,
+        "the total counts every lock, not just the returned one: {total}"
+    );
+}
+
+#[tokio::test]
+async fn the_inventory_total_exceeds_the_limit_on_postgres_14() {
+    assert_the_inventory_total_exceeds_the_limit("14").await;
+}
+
+#[tokio::test]
+async fn the_inventory_total_exceeds_the_limit_on_postgres_18() {
+    assert_the_inventory_total_exceeds_the_limit("18").await;
 }

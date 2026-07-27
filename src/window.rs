@@ -20,6 +20,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -68,6 +70,11 @@ mod imp {
         pub relations_page: TemplateChild<McpgRelationsPage>,
         #[template_child]
         pub locks_page: TemplateChild<McpgLocksPage>,
+
+        /// Shared with the collector: true only while the lock inventory view
+        /// is on screen. Defaults to false, so the expensive query never runs
+        /// before the user has asked to see it.
+        pub inventory_visible: Arc<AtomicBool>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -131,6 +138,15 @@ mod imp {
             let window = self.obj().clone();
             self.add_server_button
                 .connect_clicked(move |_| window.present_add_server_dialog());
+
+            // The inventory query runs only while its view is on screen. The
+            // flag is shared with whichever collector is running, and is set
+            // from the current state as well as on every change, so a page
+            // already showing the inventory at connect time is not missed.
+            let visible = Arc::clone(&self.inventory_visible);
+            self.locks_page.connect_inventory_visibility(move |on| {
+                visible.store(on, Ordering::Relaxed);
+            });
 
             let window = self.obj().clone();
             self.server_list.connect_row_selected(move |_, row| {
@@ -348,6 +364,8 @@ impl MissionCentrePgWindow {
             ),
             statements_limit: settings.int("statements-limit").max(10) as i64,
             relations_limit: settings.int("relations-limit").max(10) as i64,
+            locks_limit: settings.int("locks-limit").max(50) as i64,
+            inventory_visible: Arc::clone(&imp.inventory_visible),
             history_mode: params.history,
             history_interval: std::time::Duration::from_millis(
                 settings.int("history-interval-ms").max(10000) as u64,
@@ -465,6 +483,8 @@ impl MissionCentrePgWindow {
                 }
                 // Locks ride the fast tier, so this is Some on every tick.
                 imp.locks_page.update(snapshot.locks.as_ref());
+                imp.locks_page
+                    .update_inventory(snapshot.lock_inventory.as_ref());
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);

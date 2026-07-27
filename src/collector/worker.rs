@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -31,7 +33,9 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::actions::{Action, ActionOutcome};
 use crate::collector::action_runner::run_action;
 use crate::collector::history_io::{gtk_free_log, open_history, retention_cutoff, write_history};
-use crate::collector::locks::{map_participant, LocksSample, BLOCKED_SQL};
+use crate::collector::locks::{
+    map_lock_entry, map_participant, LockInventorySample, LocksSample, BLOCKED_SQL, INVENTORY_SQL,
+};
 use crate::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -179,6 +183,13 @@ pub struct CollectorConfig {
     pub slow_interval: Duration,
     pub statements_limit: i64,
     pub relations_limit: i64,
+    pub locks_limit: i64,
+    /// Set by the window while the lock inventory view is on screen. The
+    /// query is expensive and rarely watched, so it runs only while it is
+    /// visible. It fails closed: an inventory one refresh stale is a far
+    /// better failure than an expensive query running for a page nobody has
+    /// open.
+    pub inventory_visible: Arc<AtomicBool>,
     pub history_mode: HistoryMode,
     pub history_interval: Duration,
     pub history_retention_days: i64,
@@ -535,7 +546,13 @@ async fn sample_loop(
                 }
             });
 
-        match sample(client, previous, slow).await {
+        // Fails closed: an unset flag means the inventory is not sampled.
+        let inventory_limit = config
+            .inventory_visible
+            .load(Ordering::Relaxed)
+            .then_some(config.locks_limit);
+
+        match sample(client, previous, slow, inventory_limit).await {
             Ok(snapshot) => {
                 consecutive_failures = 0;
                 had_success = true;
@@ -655,6 +672,7 @@ async fn sample(
     client: &Client,
     previous: Option<(DatabaseCounters, Instant)>,
     slow: Option<SlowTier<'_>>,
+    inventory_limit: Option<i64>,
 ) -> Result<Snapshot, CollectorError> {
     let taken_at = Instant::now();
 
@@ -701,6 +719,22 @@ async fn sample(
             }),
     )?);
 
+    // `None` means the inventory view is not on screen, which the page renders
+    // as its resting state rather than as an error.
+    let lock_inventory = match inventory_limit {
+        None => None,
+        Some(limit) => Some(classify_slow(
+            client
+                .query(INVENTORY_SQL, &[&limit])
+                .await
+                .map_err(map_query_error)
+                .map(|rows| LockInventorySample {
+                    total: rows.first().map(|row| row.get("total")).unwrap_or(0),
+                    locks: rows.iter().map(map_lock_entry).collect(),
+                }),
+        )?),
+    };
+
     let (statements, relations) = match slow {
         None => (None, None),
         Some(slow) => {
@@ -731,6 +765,7 @@ async fn sample(
         statements,
         relations,
         locks,
+        lock_inventory,
     })
 }
 
