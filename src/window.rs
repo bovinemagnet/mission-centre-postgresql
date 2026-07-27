@@ -312,6 +312,7 @@ impl MissionCentrePgWindow {
         imp.sessions_page.set_privilege_limited(false);
         imp.queries_page.set_privilege_limited(false);
         imp.locks_page.set_privilege_limited(false);
+        imp.replication_page.set_privilege_limited(false);
         // The below-floor warning belongs to the previously connected server;
         // clear it so it cannot survive onto the server about to be selected.
         imp.below_floor_warning.replace(None);
@@ -444,6 +445,7 @@ impl MissionCentrePgWindow {
                 imp.sessions_page.set_privilege_limited(limited);
                 imp.queries_page.set_privilege_limited(limited);
                 imp.locks_page.set_privilege_limited(limited);
+                imp.replication_page.set_privilege_limited(limited);
                 imp.queries_page.set_statements_availability(
                     &info.statements,
                     &imp.connected_database.borrow(),

@@ -231,6 +231,8 @@ mod imp {
         #[template_child]
         pub error_banner: TemplateChild<adw::Banner>,
         #[template_child]
+        pub privilege_note: TemplateChild<adw::Banner>,
+        #[template_child]
         pub standbys_group: TemplateChild<gtk::Box>,
         #[template_child]
         pub standbys_empty: TemplateChild<gtk::Label>,
@@ -396,6 +398,14 @@ impl McpgReplicationPage {
     /// databases are invisible from here, and silence would read as "none".
     pub fn set_database(&self, database: &str) {
         self.imp().database.replace(database.to_string());
+    }
+
+    /// Explains the blank columns a limited role sees. Unlike the Locks page,
+    /// the rows themselves are still returned — `pg_stat_replication` masks
+    /// fields rather than hiding standbys — so the risk here is a standby
+    /// looking idle rather than a server looking uncontended.
+    pub fn set_privilege_limited(&self, limited: bool) {
+        self.imp().privilege_note.set_revealed(limited);
     }
 
     pub fn set_version(&self, version_num: i32) {

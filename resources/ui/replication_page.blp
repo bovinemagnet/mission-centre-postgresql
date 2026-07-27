@@ -8,6 +8,11 @@ template $McpgReplicationPage: Gtk.Box {
     revealed: false;
   }
 
+  Adw.Banner privilege_note {
+    revealed: false;
+    title: _("Standby details are hidden without pg_monitor. Blank columns do not mean the standby is idle.");
+  }
+
   Gtk.ScrolledWindow {
     vexpand: true;
 
