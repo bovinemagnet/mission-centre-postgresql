@@ -97,6 +97,76 @@ fn node_from(value: &Value) -> PlanNode {
     }
 }
 
+/// One rendered line: a node and how deep it sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanRow {
+    pub depth: usize,
+    pub node: PlanNode,
+}
+
+pub fn flatten(root: &PlanNode) -> Vec<PlanRow> {
+    let mut rows = Vec::new();
+    push(root, 0, &mut rows);
+    rows
+}
+
+fn push(node: &PlanNode, depth: usize, rows: &mut Vec<PlanRow>) {
+    rows.push(PlanRow {
+        depth,
+        node: node.clone(),
+    });
+    for child in &node.children {
+        push(child, depth + 1, rows);
+    }
+}
+
+/// The plan in the server's own idiom, rebuilt from the JSON so a second round
+/// trip in `FORMAT TEXT` is not needed.
+pub fn render_text(root: &PlanNode) -> String {
+    flatten(root)
+        .iter()
+        .map(|row| {
+            let indent = "  ".repeat(row.depth);
+            let arrow = if row.depth == 0 { "" } else { "->  " };
+            let relation = match row.node.relation.as_deref() {
+                Some(name) => format!(" on {name}"),
+                None => String::new(),
+            };
+            format!(
+                "{indent}{arrow}{}{relation}  (cost={:.2}..{:.2} rows={} width={})",
+                row.node.node_type,
+                row.node.startup_cost,
+                row.node.total_cost,
+                row.node.rows,
+                row.node.width
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Wraps a statement for explaining, or refuses it.
+///
+/// `EXPLAIN` takes a statement rather than a string, so the text cannot be
+/// passed as a parameter and has to be composed into SQL. The refusal below is
+/// what stops that becoming a second statement: everything after the first
+/// semicolon must be whitespace. The text itself comes from
+/// `pg_stat_statements` on the same server and is normalised, so it carries no
+/// literals — but refusing costs nothing, and the alternative is trusting that
+/// permanently.
+pub fn explain_sql(statement: &str) -> Option<String> {
+    let trimmed = statement.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(index) = trimmed.find(';') {
+        if !trimmed[index + 1..].trim().is_empty() {
+            return None;
+        }
+    }
+    Some(format!("EXPLAIN (GENERIC_PLAN, FORMAT JSON) {trimmed}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +211,54 @@ mod tests {
             "Total Cost":2.0,"Plan Rows":1,"Plan Width":8}}]"#;
 
         assert_eq!(parse_plan(json).expect("parses").relation, None);
+    }
+
+    #[test]
+    fn flattening_is_depth_first_with_increasing_depth() {
+        let plan = parse_plan(NESTED).unwrap();
+        let rows = flatten(&plan);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            (rows[0].depth, rows[0].node.node_type.as_str()),
+            (0, "Nested Loop")
+        );
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].depth, 1);
+    }
+
+    #[test]
+    fn the_text_rendering_indents_children_and_names_costs() {
+        let text = render_text(&parse_plan(NESTED).unwrap());
+        let lines: Vec<_> = text.lines().collect();
+
+        assert!(lines[0].starts_with("Nested Loop"));
+        assert!(lines[0].contains("cost=0.29..24.36"));
+        assert!(
+            lines[1].starts_with("  ->"),
+            "children are indented: {:?}",
+            lines[1]
+        );
+        assert!(lines[1].contains("on orders"), "a scan names its relation");
+    }
+
+    #[test]
+    fn a_single_statement_is_wrapped_for_explaining() {
+        let sql = explain_sql("SELECT * FROM t WHERE id = $1").expect("accepted");
+
+        assert!(sql.starts_with("EXPLAIN (GENERIC_PLAN, FORMAT JSON) "));
+        assert!(sql.ends_with("SELECT * FROM t WHERE id = $1"));
+        assert!(!sql.contains("ANALYZE"), "ANALYZE must never be emitted");
+    }
+
+    #[test]
+    fn a_trailing_semicolon_is_accepted_but_a_second_statement_is_not() {
+        assert!(explain_sql("SELECT 1;").is_some());
+        assert!(explain_sql("SELECT 1;   \n").is_some());
+        // Anything after the semicolon would make this two statements.
+        assert!(explain_sql("SELECT 1; DROP TABLE t").is_none());
+        assert!(explain_sql("SELECT 1;SELECT 2").is_none());
+        assert!(explain_sql("   ").is_none());
     }
 
     #[test]
