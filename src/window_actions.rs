@@ -167,13 +167,12 @@ impl MissionCentrePgWindow {
     /// Separate from `activate_action_named` so the selected-row lookups can
     /// use `?`: the activation path itself returns nothing.
     fn action_for(&self, name: &str) -> Option<Action> {
-        let imp = self.imp();
         match name {
             ACTION_CANCEL => Some(Action::CancelBackend {
-                pid: imp.sessions_page.selected_session()?.pid,
+                pid: self.signal_target()?.pid,
             }),
             ACTION_TERMINATE => Some(Action::TerminateBackend {
-                pid: imp.sessions_page.selected_session()?.pid,
+                pid: self.signal_target()?.pid,
             }),
             ACTION_ANALYZE => self.maintenance_action(MaintenanceKind::Analyze),
             ACTION_VACUUM => self.maintenance_action(MaintenanceKind::Vacuum),
@@ -181,6 +180,18 @@ impl MissionCentrePgWindow {
             ACTION_RESET_STATEMENTS => Some(Action::ResetStatements),
             ACTION_RELOAD_CONF => Some(Action::ReloadConfig),
             _ => None,
+        }
+    }
+
+    /// The backend a cancel or terminate would act on. Both the Sessions and
+    /// the Locks page can select one, so the target follows whichever page the
+    /// user is looking at — otherwise terminating a blocker found on the Locks
+    /// page would silently signal whatever the Sessions page had selected.
+    fn signal_target(&self) -> Option<Session> {
+        let imp = self.imp();
+        match imp.view_stack.visible_child_name().as_deref() {
+            Some("locks") => imp.locks_page.selected_session(),
+            _ => imp.sessions_page.selected_session(),
         }
     }
 
@@ -197,9 +208,7 @@ impl MissionCentrePgWindow {
     /// affirmative response.
     fn confirm_then(&self, action: Action) {
         let session_body = || {
-            self.imp()
-                .sessions_page
-                .selected_session()
+            self.signal_target()
                 .map(|session| confirmation_body(&session))
                 .unwrap_or_default()
         };
@@ -293,6 +302,7 @@ impl MissionCentrePgWindow {
 
         imp.sessions_page.set_capabilities(&capabilities);
         imp.relations_page.set_capabilities(&capabilities);
+        imp.locks_page.set_capabilities(&capabilities);
     }
 
     fn set_action_enabled(&self, name: &str, enabled: bool) {

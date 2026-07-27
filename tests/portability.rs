@@ -26,6 +26,9 @@ use std::time::Duration;
 
 use mission_centre_pg::actions::sql::plan_for;
 use mission_centre_pg::actions::{Action, MaintenanceKind};
+use mission_centre_pg::collector::locks::{
+    build_forest, map_lock_entry, map_participant, BLOCKED_SQL, INVENTORY_SQL,
+};
 use mission_centre_pg::collector::queries::{
     count_sessions, map_database_counters, map_session, map_settings, ACTIVITY_SQL,
     DATABASE_SIZE_SQL, DATABASE_STATS_SQL, SETTINGS_SQL,
@@ -33,6 +36,7 @@ use mission_centre_pg::collector::queries::{
 use mission_centre_pg::collector::relations::{
     map_index_stats, map_table_stats, tables_sql, INDEXES_SQL,
 };
+use mission_centre_pg::collector::replication::sample_replication;
 use mission_centre_pg::collector::snapshot::DatabaseCounters;
 use mission_centre_pg::collector::statements::{
     apply_deltas, counters_by_key, map_statement, STATEMENTS_SQL,
@@ -711,4 +715,331 @@ async fn action_statements_run_on_postgres_14() {
 #[tokio::test]
 async fn action_statements_run_on_postgres_18() {
     assert_action_statements_run("18").await;
+}
+
+/// The blocked-lock query must run on both versions, and must report nothing
+/// on a server with no contention — the healthy case the page renders as
+/// "No blocked sessions".
+async fn assert_blocked_sql_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(BLOCKED_SQL, &[])
+        .await
+        .expect("the blocked-lock query must run");
+
+    assert!(rows.is_empty(), "an idle server has no lock contention");
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_on_postgres_14() {
+    assert_blocked_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_on_postgres_18() {
+    assert_blocked_sql_runs("18").await;
+}
+
+/// Real contention, not a fixture: one transaction holds a row lock, a second
+/// waits on it. Proves the union of waiters and blockers produces a root
+/// carrying the holder's state, which is the whole point of the query.
+async fn assert_blocked_sql_finds_a_real_conflict(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute(
+            "CREATE TABLE conflict (id int PRIMARY KEY, note text);
+             INSERT INTO conflict VALUES (1, 'a')",
+        )
+        .await
+        .expect("failed to create the conflict table");
+
+    let holder = connect_as(&container, "postgres", "postgres").await;
+    holder
+        .batch_execute("BEGIN; UPDATE conflict SET note = 'held' WHERE id = 1")
+        .await
+        .expect("the holder must take the row lock");
+
+    let waiter = connect_as(&container, "postgres", "postgres").await;
+    let waiting = tokio::spawn(async move {
+        waiter
+            .execute("UPDATE conflict SET note = 'waiting' WHERE id = 1", &[])
+            .await
+    });
+
+    // The waiter needs a moment to reach the lock manager and register.
+    let forest = wait_for(|| async {
+        let rows = client.query(BLOCKED_SQL, &[]).await.ok()?;
+        let participants: Vec<_> = rows.iter().map(map_participant).collect();
+        let forest = build_forest(&participants);
+        (!forest.is_empty()).then_some(forest)
+    })
+    .await
+    .expect("the conflict must appear in the blocked-lock query");
+
+    assert_eq!(forest.len(), 1, "one chain, not several");
+    assert_eq!(forest[0].children.len(), 1, "with one waiter beneath it");
+    assert_eq!(
+        forest[0].participant.state.as_deref(),
+        Some("idle in transaction"),
+        "the root is the transaction holding the lock"
+    );
+    assert!(
+        forest[0].children[0].participant.waiting,
+        "the child is the backend actually waiting"
+    );
+
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("failed to release the lock");
+    let _ = waiting.await;
+}
+
+#[tokio::test]
+async fn blocked_sql_finds_a_real_conflict_on_postgres_14() {
+    assert_blocked_sql_finds_a_real_conflict("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_finds_a_real_conflict_on_postgres_18() {
+    assert_blocked_sql_finds_a_real_conflict("18").await;
+}
+
+/// Settles the privilege question by observation: a role without pg_monitor
+/// must still be able to run the query, whatever it does or does not mask.
+async fn assert_blocked_sql_runs_for_a_plain_role(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the plain role");
+
+    let plain = connect_as(&container, "plain", "plain").await;
+    let rows = plain
+        .query(BLOCKED_SQL, &[])
+        .await
+        .expect("a role without pg_monitor must still run the query");
+
+    assert!(rows.is_empty(), "an idle server has no lock contention");
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_for_a_plain_role_on_postgres_14() {
+    assert_blocked_sql_runs_for_a_plain_role("14").await;
+}
+
+#[tokio::test]
+async fn blocked_sql_runs_for_a_plain_role_on_postgres_18() {
+    assert_blocked_sql_runs_for_a_plain_role("18").await;
+}
+
+/// The inventory must run on both versions, and never comes back empty: the
+/// querying backend holds locks of its own while it runs.
+async fn assert_inventory_sql_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(INVENTORY_SQL, &[&500i64])
+        .await
+        .expect("the lock inventory query must run");
+
+    assert!(
+        !rows.is_empty(),
+        "the querying backend holds locks of its own"
+    );
+    let entries: Vec<_> = rows.iter().map(map_lock_entry).collect();
+    assert!(
+        entries.iter().all(|entry| entry.mode.is_some()),
+        "every lock has a mode: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn inventory_sql_runs_on_postgres_14() {
+    assert_inventory_sql_runs("14").await;
+}
+
+#[tokio::test]
+async fn inventory_sql_runs_on_postgres_18() {
+    assert_inventory_sql_runs("18").await;
+}
+
+/// The total counts past the limit, which is what lets the page report
+/// truncation rather than implying the short list is the whole story.
+async fn assert_the_inventory_total_exceeds_the_limit(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let rows = client
+        .query(INVENTORY_SQL, &[&1i64])
+        .await
+        .expect("the lock inventory query must run");
+
+    assert_eq!(rows.len(), 1, "the limit is honoured");
+    let total: i64 = rows[0].get("total");
+    assert!(
+        total > 1,
+        "the total counts every lock, not just the returned one: {total}"
+    );
+}
+
+#[tokio::test]
+async fn the_inventory_total_exceeds_the_limit_on_postgres_14() {
+    assert_the_inventory_total_exceeds_the_limit("14").await;
+}
+
+#[tokio::test]
+async fn the_inventory_total_exceeds_the_limit_on_postgres_18() {
+    assert_the_inventory_total_exceeds_the_limit("18").await;
+}
+
+/// Every replication query must run on both versions. A fresh server is a
+/// primary with no standbys, no slots and no subscriptions — the ordinary
+/// case, and one that must not be mistaken for a failure.
+async fn assert_replication_sample_runs(tag: &str) {
+    let (client, _container) = connect(tag).await;
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let sample = sample_replication(&client, version)
+        .await
+        .expect("the replication sample must run");
+
+    assert!(!sample.in_recovery, "a fresh container is a primary");
+    assert!(sample.standbys.is_empty());
+    assert!(sample.slots.is_empty());
+    assert!(sample.subscriptions.is_empty());
+    assert!(sample.receiver.is_none(), "a primary has no upstream");
+}
+
+#[tokio::test]
+async fn replication_sample_runs_on_postgres_14() {
+    assert_replication_sample_runs("14").await;
+}
+
+#[tokio::test]
+async fn replication_sample_runs_on_postgres_18() {
+    assert_replication_sample_runs("18").await;
+}
+
+/// A physical slot needs no standby to create, which gives a genuinely
+/// inactive slot to assert the sort rule against on a single container.
+async fn assert_an_inactive_slot_is_reported_and_sorted_first(tag: &str) {
+    let (client, _container) = connect(tag).await;
+    client
+        .batch_execute(
+            "SELECT pg_create_physical_replication_slot('spare');
+             SELECT pg_create_physical_replication_slot('another')",
+        )
+        .await
+        .expect("failed to create the slots");
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let sample = sample_replication(&client, version)
+        .await
+        .expect("the replication sample must run");
+
+    assert_eq!(sample.slots.len(), 2);
+    assert!(
+        sample.slots.iter().all(|slot| !slot.active),
+        "a slot with no consumer is inactive: {:?}",
+        sample.slots
+    );
+    assert_eq!(
+        sample.slots[0].slot_name, "another",
+        "equally inactive slots sort by name"
+    );
+    assert_eq!(sample.slots[0].slot_type.as_deref(), Some("physical"));
+}
+
+#[tokio::test]
+async fn an_inactive_slot_is_reported_and_sorted_first_on_postgres_14() {
+    assert_an_inactive_slot_is_reported_and_sorted_first("14").await;
+}
+
+#[tokio::test]
+async fn an_inactive_slot_is_reported_and_sorted_first_on_postgres_18() {
+    assert_an_inactive_slot_is_reported_and_sorted_first("18").await;
+}
+
+/// The version boundary that an earlier draft of the spec got wrong:
+/// inactive_since is PostgreSQL 17, not 16. Before it, the sample must carry
+/// None rather than a fabricated zero.
+#[tokio::test]
+async fn the_inactive_duration_is_absent_before_postgres_17() {
+    let (client, _container) = connect("14").await;
+    client
+        .batch_execute("SELECT pg_create_physical_replication_slot('spare')")
+        .await
+        .expect("failed to create the slot");
+
+    let sample = sample_replication(&client, 140000)
+        .await
+        .expect("the replication sample must run");
+
+    assert_eq!(sample.slots[0].inactive_since_secs, None);
+    assert_eq!(sample.slots[0].conflicting, None);
+}
+
+#[tokio::test]
+async fn the_inactive_duration_is_reported_on_postgres_18() {
+    let (client, _container) = connect("18").await;
+    client
+        .batch_execute("SELECT pg_create_physical_replication_slot('spare')")
+        .await
+        .expect("failed to create the slot");
+
+    let sample = sample_replication(&client, 180000)
+        .await
+        .expect("the replication sample must run");
+
+    assert!(
+        sample.slots[0].inactive_since_secs.is_some(),
+        "PostgreSQL 17 and later report how long a slot has been inactive"
+    );
+    // `conflicting` stays NULL for a physical slot even where the column
+    // exists: it describes a logical slot invalidated by recovery conflict.
+    // The page must therefore treat None as "not applicable" rather than as
+    // "not conflicting".
+    assert_eq!(sample.slots[0].conflicting, None);
+}
+
+/// Settles the privilege question by observation for the replication views,
+/// as the lock tests do for pg_locks.
+async fn assert_replication_runs_for_a_plain_role(tag: &str) {
+    let (client, container) = connect(tag).await;
+    client
+        .batch_execute("CREATE ROLE plain LOGIN PASSWORD 'plain'")
+        .await
+        .expect("failed to create the plain role");
+
+    let version: i32 = client
+        .query_one(PROBE_SQL, &[])
+        .await
+        .expect("probe failed")
+        .get("version_num");
+
+    let plain = connect_as(&container, "plain", "plain").await;
+    sample_replication(&plain, version)
+        .await
+        .expect("a role without pg_monitor must still run the replication queries");
+}
+
+#[tokio::test]
+async fn replication_runs_for_a_plain_role_on_postgres_14() {
+    assert_replication_runs_for_a_plain_role("14").await;
+}
+
+#[tokio::test]
+async fn replication_runs_for_a_plain_role_on_postgres_18() {
+    assert_replication_runs_for_a_plain_role("18").await;
 }

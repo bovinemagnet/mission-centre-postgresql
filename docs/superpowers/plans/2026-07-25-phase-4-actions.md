@@ -2663,7 +2663,7 @@ git commit -m "feat: window actions, confirmation dialogs and result toasts"
 - Consumes: everything.
 - Produces: a verified Phase 4.
 
-- [ ] **Step 1: Run every automated check**
+- [x] **Step 1: Run every automated check**
 
 ```bash
 cargo fmt --check
@@ -2675,14 +2675,14 @@ ninja -C build
 ```
 Expected: no diff from `fmt`; all unit tests pass; all container tests pass on 14 and 18; the build completes.
 
-- [ ] **Step 2: Confirm no file has grown past the limit**
+- [x] **Step 2: Confirm no file has grown past the limit**
 
 ```bash
 find src -name '*.rs' -exec wc -l {} + | sort -rn | head -5
 ```
 Expected: the largest file is under ~800 lines. If one is not, split it before continuing.
 
-- [ ] **Step 3: Walk the success criteria against a live server**
+- [x] **Step 3: Walk the success criteria against a live server**
 
 Start a container with a superuser and a plain role:
 
@@ -2710,22 +2710,22 @@ MCPG_RESOURCE_DIR=$PWD/build/resources GSETTINGS_SCHEMA_DIR=$PWD/data ./build/sr
 
 Check each, ticking them off:
 
-- [ ] As `postgres` on `127.0.0.1:55432`: all seven controls become sensitive once a row is selected.
-- [ ] As `watcher` (pg_monitor, no signal privilege): every action stays insensitive, and the sessions bar shows the pg_signal_backend reason.
-- [ ] As `app`: `app_orders` is selectable and maintainable; no other table is, and the tables bar shows the reason when one of those is selected.
-- [ ] Select a session, wait through five refreshes: the selection and the enabled buttons persist.
-- [ ] Terminate a session opened from a second `psql`: the dialog names its PID, user, database and query; the row disappears on the next sample.
-- [ ] Cancel a backend that has already exited: the toast reads "no longer running", not success and not an error.
-- [ ] `VACUUM` a table large enough to take over a minute (`INSERT INTO app_orders SELECT g, 'n'||g FROM generate_series(1,20000000) g;` then delete half): the Overview graphs keep updating for its whole duration, an in-flight toast is visible, and a result toast replaces it.
-- [ ] Switch servers mid-`VACUUM`: the in-flight toast goes; no crash. This is the documented §4.4 limitation.
+- [x] As `postgres` on `127.0.0.1:55432`: all seven controls become sensitive once a row is selected.
+- [x] As `watcher` (pg_monitor, no signal privilege): every action stays insensitive, and the sessions bar shows the pg_signal_backend reason.
+- [x] As `app`: `app_orders` is selectable and maintainable; no other table is, and the tables bar shows the reason when one of those is selected.
+- [x] Select a session, wait through five refreshes: the selection and the enabled buttons persist.
+- [x] Terminate a session opened from a second `psql`: the dialog names its PID, user, database and query; the row disappears on the next sample.
+- [x] Cancel a backend that has already exited: the toast reads "no longer running", not success and not an error.
+- [x] `VACUUM` a table large enough to take over a minute (`INSERT INTO app_orders SELECT g, 'n'||g FROM generate_series(1,20000000) g;` then delete half): the Overview graphs keep updating for its whole duration, an in-flight toast is visible, and a result toast replaces it.
+- [x] Switch servers mid-`VACUUM`: the in-flight toast goes; no crash. This is the documented §4.4 limitation.
 
-- [ ] **Step 4: Tear down**
+- [x] **Step 4: Tear down**
 
 ```bash
 podman rm -f mcpg-phase4
 ```
 
-- [ ] **Step 5: Commit any fixes and open the pull request**
+- [x] **Step 5: Commit any fixes and open the pull request**
 
 ```bash
 git status --short          # expect clean unless a check needed a fix

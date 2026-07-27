@@ -87,6 +87,20 @@ template $MissionCentrePgWindow: Adw.ApplicationWindow {
             icon-name: "drive-harddisk-symbolic";
             child: $McpgRelationsPage relations_page {};
           }
+
+          Adw.ViewStackPage {
+            name: "locks";
+            title: _("Locks");
+            icon-name: "changes-prevent-symbolic";
+            child: $McpgLocksPage locks_page {};
+          }
+
+          Adw.ViewStackPage {
+            name: "replication";
+            title: _("Replication");
+            icon-name: "network-transmit-receive-symbolic";
+            child: $McpgReplicationPage replication_page {};
+          }
         };
       };
     };

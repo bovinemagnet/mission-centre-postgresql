@@ -19,12 +19,16 @@
  */
 
 pub mod format;
+pub mod locks;
 pub mod overview;
 pub mod queries;
 pub mod relations;
+pub mod replication;
 pub mod sessions;
 
+pub use locks::McpgLocksPage;
 pub use overview::McpgOverviewPage;
 pub use queries::McpgQueriesPage;
 pub use relations::McpgRelationsPage;
+pub use replication::McpgReplicationPage;
 pub use sessions::McpgSessionsPage;

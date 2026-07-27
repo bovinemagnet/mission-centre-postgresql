@@ -20,6 +20,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -34,7 +36,8 @@ use mission_centre_pg::connection::probe::Capabilities;
 use mission_centre_pg::connection::{credentials, registry};
 use mission_centre_pg::dialogs::McpgAddServerDialog;
 use mission_centre_pg::pages::{
-    McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgSessionsPage,
+    McpgLocksPage, McpgOverviewPage, McpgQueriesPage, McpgRelationsPage, McpgReplicationPage,
+    McpgSessionsPage,
 };
 use mission_centre_pg::widgets::sidebar_row::{ConnectionState, McpgSidebarRow};
 
@@ -66,6 +69,17 @@ mod imp {
         pub queries_page: TemplateChild<McpgQueriesPage>,
         #[template_child]
         pub relations_page: TemplateChild<McpgRelationsPage>,
+        #[template_child]
+        pub locks_page: TemplateChild<McpgLocksPage>,
+        #[template_child]
+        pub replication_page: TemplateChild<McpgReplicationPage>,
+        #[template_child]
+        pub view_stack: TemplateChild<adw::ViewStack>,
+
+        /// Shared with the collector: true only while the lock inventory view
+        /// is on screen. Defaults to false, so the expensive query never runs
+        /// before the user has asked to see it.
+        pub inventory_visible: Arc<AtomicBool>,
 
         pub settings: RefCell<Option<gio::Settings>>,
         pub servers: RefCell<Vec<ConnectionParams>>,
@@ -106,6 +120,8 @@ mod imp {
             McpgSessionsPage::ensure_type();
             McpgQueriesPage::ensure_type();
             McpgRelationsPage::ensure_type();
+            McpgLocksPage::ensure_type();
+            McpgReplicationPage::ensure_type();
             klass.bind_template();
         }
 
@@ -128,6 +144,15 @@ mod imp {
             let window = self.obj().clone();
             self.add_server_button
                 .connect_clicked(move |_| window.present_add_server_dialog());
+
+            // The inventory query runs only while its view is on screen. The
+            // flag is shared with whichever collector is running, and is set
+            // from the current state as well as on every change, so a page
+            // already showing the inventory at connect time is not missed.
+            let visible = Arc::clone(&self.inventory_visible);
+            self.locks_page.connect_inventory_visibility(move |on| {
+                visible.store(on, Ordering::Relaxed);
+            });
 
             let window = self.obj().clone();
             self.server_list.connect_row_selected(move |_, row| {
@@ -286,6 +311,8 @@ impl MissionCentrePgWindow {
         imp.privilege_banner.set_revealed(false);
         imp.sessions_page.set_privilege_limited(false);
         imp.queries_page.set_privilege_limited(false);
+        imp.locks_page.set_privilege_limited(false);
+        imp.replication_page.set_privilege_limited(false);
         // The below-floor warning belongs to the previously connected server;
         // clear it so it cannot survive onto the server about to be selected.
         imp.below_floor_warning.replace(None);
@@ -345,6 +372,8 @@ impl MissionCentrePgWindow {
             ),
             statements_limit: settings.int("statements-limit").max(10) as i64,
             relations_limit: settings.int("relations-limit").max(10) as i64,
+            locks_limit: settings.int("locks-limit").max(50) as i64,
+            inventory_visible: Arc::clone(&imp.inventory_visible),
             history_mode: params.history,
             history_interval: std::time::Duration::from_millis(
                 settings.int("history-interval-ms").max(10000) as u64,
@@ -415,12 +444,20 @@ impl MissionCentrePgWindow {
                 ));
                 imp.sessions_page.set_privilege_limited(limited);
                 imp.queries_page.set_privilege_limited(limited);
+                imp.locks_page.set_privilege_limited(limited);
+                imp.replication_page.set_privilege_limited(limited);
                 imp.queries_page.set_statements_availability(
                     &info.statements,
                     &imp.connected_database.borrow(),
                 );
                 imp.relations_page
                     .set_database(&imp.connected_database.borrow());
+                // The replication page needs both: publications are visible
+                // only for the connected database, and the slot columns
+                // depend on the server version.
+                imp.replication_page
+                    .set_database(&imp.connected_database.borrow());
+                imp.replication_page.set_version(info.version_num);
                 self.set_capabilities(Some(info.capabilities));
 
                 if info.is_below_floor() {
@@ -460,6 +497,13 @@ impl MissionCentrePgWindow {
                     Some(Err(error)) => imp.relations_page.set_error(&i18n(&error.to_string())),
                     None => {}
                 }
+                // Locks ride the fast tier, so this is Some on every tick.
+                imp.locks_page.update(snapshot.locks.as_ref());
+                imp.locks_page
+                    .update_inventory(snapshot.lock_inventory.as_ref());
+                // Slow tier: None on a fast tick, and the page keeps what it
+                // has rather than blanking between slow samples.
+                imp.replication_page.update(snapshot.replication.as_ref());
                 if let Some(row) = self.selected_row() {
                     row.set_state(ConnectionState::Connected);
                     row.push_value(snapshot.session_counts.total() as f64);

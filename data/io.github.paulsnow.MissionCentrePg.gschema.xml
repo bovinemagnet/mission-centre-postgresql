@@ -42,6 +42,12 @@
       <default>200</default>
       <summary>Rows fetched from each relation statistics view per slow sample</summary>
     </key>
+    <key name="locks-limit" type="i">
+      <range min="50" max="5000"/>
+      <default>500</default>
+      <summary>Rows fetched for the full lock inventory</summary>
+      <description>How many rows the lock inventory fetches. The page reports the untruncated total when this limit is reached, so a shortened list is never mistaken for the whole picture.</description>
+    </key>
     <key name="history-interval-ms" type="i">
       <range min="10000" max="600000"/>
       <default>60000</default>

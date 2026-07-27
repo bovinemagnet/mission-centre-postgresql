@@ -1,0 +1,136 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $McpgLocksPage: Gtk.Box {
+  orientation: vertical;
+
+  Adw.Banner privilege_note {
+    revealed: false;
+    title: _("Query text for other users' backends is hidden without pg_monitor.");
+  }
+
+  Gtk.Box {
+    halign: center;
+    margin-top: 6;
+    margin-bottom: 6;
+
+    Adw.ViewSwitcher {
+      stack: view_stack;
+      policy: wide;
+    }
+  }
+
+  Adw.ViewStack view_stack {
+    vexpand: true;
+
+    Adw.ViewStackPage {
+      name: "tree";
+      title: _("Blocked Sessions");
+
+      child: Gtk.Stack tree_stack {
+        vexpand: true;
+
+        Gtk.StackPage {
+          name: "empty";
+
+          child: Adw.StatusPage {
+            icon-name: "emblem-ok-symbolic";
+            title: _("No blocked sessions");
+            description: _("Nothing is waiting on a lock.");
+          };
+        }
+
+        Gtk.StackPage {
+          name: "tree";
+
+          child: Gtk.ScrolledWindow {
+            vexpand: true;
+
+            child: Gtk.ColumnView column_view {
+              show-column-separators: true;
+              reorderable: false;
+            };
+          };
+        }
+
+        Gtk.StackPage {
+          name: "restricted";
+
+          child: Adw.StatusPage {
+            icon-name: "dialog-question-symbolic";
+            title: _("Contention cannot be seen");
+            description: _("Without pg_monitor, other users' backends are hidden from pg_stat_activity, so blocked sessions cannot be detected. This is not the same as there being none.");
+          };
+        }
+
+        Gtk.StackPage {
+          name: "unavailable";
+
+          child: Adw.StatusPage unavailable_page {
+            icon-name: "dialog-information-symbolic";
+            title: _("Locks unavailable");
+          };
+        }
+      };
+    }
+
+    Adw.ViewStackPage {
+      name: "inventory";
+      title: _("All Locks");
+
+      child: Gtk.Box {
+        orientation: vertical;
+
+        Gtk.ScrolledWindow {
+          vexpand: true;
+
+          child: Gtk.ColumnView inventory_view {
+            show-column-separators: true;
+            reorderable: false;
+          };
+        }
+
+        Gtk.Label truncation_label {
+          xalign: 0;
+          visible: false;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 6;
+
+          styles ["dim-label", "caption"]
+        }
+      };
+    }
+  }
+
+  Gtk.Box {
+    spacing: 6;
+    margin-start: 12;
+    margin-end: 12;
+    margin-top: 6;
+    margin-bottom: 12;
+
+    Gtk.Label signal_reason {
+      hexpand: true;
+      xalign: 0;
+      visible: false;
+      wrap: true;
+
+      styles ["dim-label", "caption"]
+    }
+
+    Gtk.Button cancel_backend_button {
+      label: _("Cancel query");
+      tooltip-text: _("Ask the selected backend to abandon its current query");
+      action-name: "win.cancel-backend";
+    }
+
+    Gtk.Button terminate_backend_button {
+      label: _("Terminate");
+      tooltip-text: _("Close the selected backend's connection");
+      action-name: "win.terminate-backend";
+
+      styles ["destructive-action"]
+    }
+  }
+}
