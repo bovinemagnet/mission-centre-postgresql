@@ -44,7 +44,7 @@ use mission_centre_pg::collector::statements::{
 use mission_centre_pg::connection::probe::{
     map_server_info, PrivilegeLevel, StatementsAvailability, PROBE_SQL,
 };
-use mission_centre_pg::explain::{explain_sql, parse_plan};
+use mission_centre_pg::explain::{explain_sql, flatten, parse_plan};
 use mission_centre_pg::history::pgconsole::{
     map_system_row, PgConsoleAvailability, INSERT_QUERY_SQL, INSERT_SYSTEM_SQL, LOAD_SYSTEM_SQL,
     PGCONSOLE_PROBE_SQL,
@@ -1137,18 +1137,29 @@ async fn generic_plan_is_accepted_on_postgres_18() {
 async fn a_statement_from_pg_stat_statements_can_be_explained_on_postgres_18() {
     let (client, _container) = connect_with_statements("18").await;
     client
-        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, note text)")
+        .batch_execute(
+            "CREATE TABLE customers (id int PRIMARY KEY, name text);
+             CREATE TABLE orders (id bigserial PRIMARY KEY, customer int);
+             INSERT INTO customers SELECT g, 'c' FROM generate_series(1,100) g;
+             INSERT INTO orders (customer) SELECT 1 FROM generate_series(1,500);
+             ANALYZE",
+        )
         .await
-        .expect("failed to create the table");
+        .expect("failed to create the tables");
+    // A join, so the plan has more than one node and the nesting is proven
+    // against real server output rather than only a hand-written fixture.
     client
-        .execute("SELECT * FROM t WHERE id = $1", &[&1i32])
+        .execute(
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer WHERE o.id = $1",
+            &[&1i64],
+        )
         .await
         .expect("failed to run a parameterised statement");
 
     let recorded = wait_for(|| async {
         client
             .query_opt(
-                "SELECT query FROM pg_stat_statements WHERE query LIKE 'SELECT * FROM t%' LIMIT 1",
+                "SELECT query FROM pg_stat_statements WHERE query LIKE 'SELECT o.id%' LIMIT 1",
                 &[],
             )
             .await
@@ -1172,5 +1183,24 @@ async fn a_statement_from_pg_stat_statements_can_be_explained_on_postgres_18() {
             .expect("a normalised statement explains with GENERIC_PLAN"),
     );
     let plan = parse_plan(&json).expect("the plan parses");
-    assert!(!plan.node_type.is_empty());
+    assert_eq!(
+        plan.children.len(),
+        2,
+        "a join plans as one node over two inputs: {plan:?}"
+    );
+    // Not every child scans a relation — the planner may put a Sort or a
+    // Gather between the join and its input — so the assertion is that the
+    // tree nests and that the leaves name what they read.
+    let rows = flatten(&plan);
+    assert!(
+        rows.iter().any(|row| row.depth >= 2),
+        "the plan nests more than one level: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| row.node.relation.is_some())
+            .count()
+            >= 2,
+        "both scanned relations appear somewhere in the tree: {rows:?}"
+    );
 }
